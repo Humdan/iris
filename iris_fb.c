@@ -3,7 +3,9 @@
 // Nodes drift on a black field, linked by edges to their neighbours.
 // Idle:     slow drift, dim edges, an occasional lazy pulse.
 // Thinking: nodes flare, pulses race along edges, the graph rewires and churns.
-// State is read from a file (default /tmp/iris_state): "thinking" or anything else.
+// State file (default /tmp/iris_state) holds an activity level 0.0-1.0 — the
+// graph's firing rate, drift and brightness scale continuously with it.
+// The words "thinking" (=1) and "idle" (=0) are also accepted.
 //
 // build: make   (gcc -O2 -ffast-math iris_fb.c -lm -lpthread)
 
@@ -208,9 +210,17 @@ int main(int argc, char **argv) {
         double t = now(); float dt = (float)(t - tlast); tlast = t; if (dt > 0.1f) dt = 0.1f;
         if (t - tcheck > 0.15) {
             tcheck = t; FILE *sf = fopen(state_file, "r");
-            if (sf) { char buf[32] = {0}; if (fgets(buf, 31, sf)) target = strncmp(buf, "thinking", 8) == 0 ? 1.0f : 0.0f; fclose(sf); }
+            if (sf) {
+                char buf[64] = {0};
+                if (fgets(buf, 63, sf)) {
+                    if (strncmp(buf, "thinking", 8) == 0) target = 1.0f;
+                    else if (strncmp(buf, "idle", 4) == 0) target = 0.0f;
+                    else { char *end; float v = strtof(buf, &end); target = end != buf ? clampf(v, 0, 1) : 0.0f; }
+                }
+                fclose(sf);
+            }
         }
-        think += (target - think) * clampf((target > think ? 2.5f : 1.0f) * dt, 0, 1);
+        think += (target - think) * clampf((target > think ? 4.0f : 1.5f) * dt, 0, 1);
         float T = (float)(t - t0);
 
         // --- physics: drift + gentle spring to neighbours + repulsion ---
@@ -238,7 +248,7 @@ int main(int argc, char **argv) {
         if (t - trewire > (2.5 - 2.0 * think)) { trewire = t; rewire(); }
 
         // --- fire pulses: rate scales hard with thinking ---
-        fire_acc += dt * (0.6f + 14.0f * think * think);
+        fire_acc += dt * (0.5f + 6.0f * think + 12.0f * think * think);
         while (fire_acc >= 1) { fire_acc -= 1; fire(rand() % NNODES, think); }
         for (int i = 0; i < NPULSE; i++) {
             Pulse *p = &pulses[i]; if (p->alive <= 0) continue;

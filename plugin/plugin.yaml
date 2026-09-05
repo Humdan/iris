@@ -1,0 +1,13 @@
+name: iris
+version: 1.0.0
+description: "Drives the Iris LCD visualizer (github.com/Humdan/iris) from live agent activity: LLM requests, tool calls and streamed tokens raise a decaying activity level written to /tmp/iris_state at 10 Hz."
+author: Humdan
+hooks:
+  - pre_api_request
+  - post_api_request
+  - api_request_error
+  - on_stream_delta
+  - pre_tool_call
+  - post_tool_call
+  - on_session_start
+  - on_session_end

@@ -50,9 +50,22 @@ iris-state idle
 
 The Python `--framebuffer` mode is kept as a fallback but is blocky and slow.
 
-The service takes over tty1, starts in idle, and restarts on failure.
-Hook an agent to it by calling `iris-state thinking` when work starts and
-`iris-state idle` when it finishes.
+The service takes over tty1, starts idle, and restarts on failure.
+
+## Driving it from Hermes Agent (live "processor" mode)
+
+`plugin/` is a Hermes plugin that turns real agent activity into a decaying
+0.0-1.0 level written to `/tmp/iris_state` at 10 Hz: every LLM request, tool
+call and streamed token kicks it up; silence lets it fall to zero in ~2 s.
+`iris_fb` scales firing rate, drift and brightness continuously with it.
+
+```bash
+ln -s ~/iris/plugin ~/.hermes/plugins/iris
+hermes plugins enable iris        # takes effect in the next Hermes session
+```
+
+You can also drive the file by hand: `echo 0.7 > /tmp/iris_state`, or the words
+`thinking` / `idle`.
 
 ## States
 

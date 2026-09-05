@@ -12,3 +12,4 @@ sleep 2
 systemctl --no-pager status iris.service | head -8
 echo
 echo "Iris installed. Control it with:  iris-state thinking  |  iris-state idle"
+echo "Hook Hermes to it:  ln -s $DIR/plugin ~/.hermes/plugins/iris && hermes plugins enable iris"
