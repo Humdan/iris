@@ -35,15 +35,19 @@ echo "idle" > /tmp/iris_state
 
 ## Pi LCD / boot service
 
-Iris can draw straight to the framebuffer (`/dev/fb0`), so it works on a
-headless Pi with an LCD and no X11:
+`iris_fb.c` is a smooth per-pixel renderer for the framebuffer (`/dev/fb0`):
+a glowing eye that breathes when idle and contracts, spins and throws sparks
+when thinking. Multithreaded C, ~20-27 fps on a Pi 4 at 800x480, no X11.
 
 ```bash
-python3 iris.py --daemon --framebuffer     # draw to the LCD
-sudo ./install.sh                           # install + enable systemd service
-iris-state thinking                         # switch animation
+make                    # builds ./iris_fb
+./iris_fb               # run on the LCD (state file /tmp/iris_state)
+sudo ./install.sh       # build, install + enable systemd service
+iris-state thinking     # switch animation
 iris-state idle
 ```
+
+The Python `--framebuffer` mode is kept as a fallback but is blocky and slow.
 
 The service takes over tty1, starts in idle, and restarts on failure.
 Hook an agent to it by calling `iris-state thinking` when work starts and

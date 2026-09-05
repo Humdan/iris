@@ -1,6 +1,7 @@
 #!/bin/sh
 # Install Iris as a boot service on the Pi LCD.
 set -e
+make -C "$(dirname "$0")" iris_fb
 DIR="$(cd "$(dirname "$0")" && pwd)"
 sudo cp "$DIR/iris.service" /etc/systemd/system/iris.service
 sudo install -m 755 "$DIR/iris-state" /usr/local/bin/iris-state
