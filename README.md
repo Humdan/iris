@@ -43,7 +43,8 @@ flare, the graph rewires. Multithreaded C, 30 fps on a Pi 4 at 800x480, no X11.
 ```bash
 make                    # builds ./iris_fb
 ./iris_fb               # run on the LCD (state file /tmp/iris_state)
-sudo ./install.sh       # build, install + enable systemd service
+./install-user.sh       # build + enable as a user service (no sudo; needs linger)
+sudo ./install.sh       # or: system service that takes over tty1
 iris-state thinking     # switch animation
 iris-state idle
 ```

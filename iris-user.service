@@ -1,0 +1,14 @@
+[Unit]
+Description=Iris - AI activity animation on the Pi LCD (user service)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/iris
+ExecStartPre=/bin/sh -c 'echo 0 > /tmp/iris_state'
+ExecStart=%h/iris/iris_fb /tmp/iris_state
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
