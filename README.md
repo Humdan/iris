@@ -33,6 +33,22 @@ echo "thinking" > /tmp/iris_state
 echo "idle" > /tmp/iris_state
 ```
 
+## Pi LCD / boot service
+
+Iris can draw straight to the framebuffer (`/dev/fb0`), so it works on a
+headless Pi with an LCD and no X11:
+
+```bash
+python3 iris.py --daemon --framebuffer     # draw to the LCD
+sudo ./install.sh                           # install + enable systemd service
+iris-state thinking                         # switch animation
+iris-state idle
+```
+
+The service takes over tty1, starts in idle, and restarts on failure.
+Hook an agent to it by calling `iris-state thinking` when work starts and
+`iris-state idle` when it finishes.
+
 ## States
 
 The animation has two primary states:

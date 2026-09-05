@@ -1,0 +1,7 @@
+#!/bin/sh
+# Set the Iris animation state. Usage: iris-state thinking|idle
+STATE_FILE="${IRIS_STATE_FILE:-/tmp/iris_state}"
+case "$1" in
+  thinking|idle) printf '%s' "$1" > "$STATE_FILE" ;;
+  *) echo "usage: $0 thinking|idle" >&2; exit 1 ;;
+esac

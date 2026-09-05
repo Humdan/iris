@@ -56,8 +56,19 @@ class ANSI:
     BG_BRIGHT_WHITE = "\0e[107m"
 
 
+_size_override = None
+
+
+def set_size_override(cols, rows):
+    """Force a fixed terminal size (used by the framebuffer renderer)."""
+    global _size_override
+    _size_override = (cols, rows)
+
+
 def get_terminal_size():
     """Get terminal dimensions."""
+    if _size_override:
+        return _size_override
     try:
         size = os.get_terminal_size()
         return size.columns, size.lines

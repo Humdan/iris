@@ -1,0 +1,24 @@
+[Unit]
+Description=Iris - AI activity animation on the Pi LCD
+After=multi-user.target
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+User=humdan
+Group=video
+WorkingDirectory=/home/humdan/iris
+ExecStartPre=/bin/sh -c 'echo idle > /tmp/iris_state; chmod 666 /tmp/iris_state'
+ExecStart=/usr/bin/python3 /home/humdan/iris/iris.py --daemon --framebuffer --state-file /tmp/iris_state
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+# Keep the kernel console from drawing a cursor over the animation
+TTYPath=/dev/tty1
+StandardInput=tty
+TTYVTDisallocate=yes
+TTYReset=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -60,9 +60,16 @@ Control:
         help='Initial animation state (default: idle)'
     )
     
+    parser.add_argument(
+        '--framebuffer',
+        action='store_true',
+        help='Render directly to /dev/fb0 (Pi LCD, no X11 needed)'
+    )
+
     args = parser.parse_args()
+    render_mode = 'framebuffer' if args.framebuffer else 'terminal'
     
-    if not is_terminal():
+    if not is_terminal() and not args.framebuffer:
         print("Warning: Output is not a terminal. Animation may not render correctly.")
         print("Run this in a terminal for best experience.")
     
@@ -76,7 +83,7 @@ Control:
         with open(args.state_file, 'w') as f:
             f.write(args.initial_state)
         
-        run_iris(state_file=args.state_file)
+        run_iris(state_file=args.state_file, render_mode=render_mode)
     else:
         print("Iris - Terminal AI Activity Visualizer")
         print(f"Initial state: {args.initial_state}")
@@ -87,7 +94,7 @@ Control:
         print()
         print("Starting animation...")
         
-        engine = AnimationEngine()
+        engine = AnimationEngine(render_mode=render_mode)
         engine.set_state(args.initial_state)
         engine.run()
     

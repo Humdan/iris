@@ -4,10 +4,9 @@ import sys
 import os
 import time
 import threading
-import importlib.util
 
 # Add project root to path
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
 
 from utils.terminal import (
@@ -23,7 +22,7 @@ from states.idle import IdleState
 class AnimationEngine:
     """Main animation engine that manages state transitions and rendering."""
     
-    def __init__(self):
+    def __init__(self, render_mode='terminal'):
         self.state = "idle"  # Start in idle state
         self.running = True
         self.last_state_change = time.time()
@@ -31,7 +30,24 @@ class AnimationEngine:
         self.thinking_state = ThinkingState()
         self.current_animation = self.idle_state
         self.start_time = time.time()
-        self.activity_log = []  # Track state changes for logging
+        self.activity_log = []
+        
+        self.render_mode = render_mode
+        self.fb_renderer = None
+        
+        if render_mode == 'framebuffer':
+            from utils.framebuffer import FramebufferRenderer
+            from utils.terminal import set_size_override
+            self.fb_renderer = FramebufferRenderer()
+            if self.fb_renderer.open():
+                set_size_override(self.fb_renderer.cols, self.fb_renderer.rows)
+                # Rebuild states at framebuffer grid size
+                self.idle_state = IdleState()
+                self.thinking_state = ThinkingState()
+                self.current_animation = self.idle_state
+            else:
+                print("Warning: Could not open framebuffer, falling back to terminal mode")
+                self.render_mode = 'terminal'
         
     def set_state(self, state_name):
         """Change the current animation state."""
@@ -79,31 +95,12 @@ class AnimationEngine:
         """Run the main animation loop."""
         try:
             with terminal_context():
-                if sys.stdin.isatty():
+                if self.render_mode == 'framebuffer' and self.fb_renderer:
+                    self._run_framebuffer()
+                elif sys.stdin.isatty():
                     # Full terminal control mode
                     clear_screen()
-                    
-                    last_time = time.time()
-                    
-                    while self.running:
-                        current_time = time.time()
-                        delta_time = current_time - last_time
-                        last_time = current_time
-                        
-                        # Update animation
-                        self.update(delta_time)
-                        
-                        # Render
-                        move_cursor(1, 1)
-                        frame = self.render_frame()
-                        write_raw(frame)
-                        clear_to_end()
-                        
-                        # Wait for next frame
-                        time.sleep(self.frame_delay)
-                        
-                        # Check for keyboard input (non-blocking)
-                        self._handle_input()
+                    self._run_tty()
                 else:
                     # Non-terminal mode - just print frames
                     self._run_non_terminal()
@@ -111,8 +108,60 @@ class AnimationEngine:
         except KeyboardInterrupt:
             pass
         finally:
+            if self.fb_renderer:
+                self.fb_renderer.close()
             show_cursor()
             reset_colors()
+            clear_screen()
+    
+    def _run_tty(self):
+        """Run in interactive terminal mode."""
+        clear_screen()
+        last_time = time.time()
+        
+        while self.running:
+            current_time = time.time()
+            delta_time = current_time - last_time
+            last_time = current_time
+            
+            # Update animation
+            self.update(delta_time)
+            
+            # Render
+            move_cursor(1, 1)
+            frame = self.render_frame()
+            write_raw(frame)
+            clear_to_end()
+            
+            # Wait for next frame
+            time.sleep(self.frame_delay)
+            
+            # Check for keyboard input (non-blocking)
+            self._handle_input()
+    
+    def _run_framebuffer(self):
+        """Run with framebuffer rendering."""
+        last_time = time.time()
+        
+        while self.running:
+            current_time = time.time()
+            delta_time = current_time - last_time
+            last_time = current_time
+            
+            # Update animation
+            self.update(delta_time)
+            
+            # Render frame
+            frame = self.render_frame()
+            
+            # Render to framebuffer
+            self.fb_renderer.render_text_frame(frame)
+            
+            # Wait for next frame
+            time.sleep(self.frame_delay)
+            
+            # Check for keyboard input
+            self._handle_input()
     
     def _run_non_terminal(self):
         """Run in non-terminal mode (for testing/debugging)."""
@@ -136,6 +185,10 @@ class AnimationEngine:
     
     def _handle_input(self):
         """Handle keyboard input (non-blocking)."""
+        if self.render_mode == 'framebuffer':
+            # No keyboard input in framebuffer mode
+            return
+            
         # Check for keyboard input without blocking
         import select
         if select.select([sys.stdin], [], [], 0) == ([], [], []):
@@ -156,14 +209,15 @@ class AnimationEngine:
             pass
 
 
-def run_iris(state_file=None):
+def run_iris(state_file=None, render_mode='terminal'):
     """Run the Iris animation engine.
     
     Args:
         state_file: Optional path to a file that can be used to control
                    the animation state from external processes.
+        render_mode: 'terminal' or 'framebuffer'
     """
-    engine = AnimationEngine()
+    engine = AnimationEngine(render_mode=render_mode)
     
     if state_file:
         # Start a thread to monitor state file

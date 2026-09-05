@@ -245,7 +245,7 @@ class ThinkingState:
     def __init__(self):
         self.width, self.height = get_terminal_size()
         # Adjust height for status line
-        self.height = min(self.height - 2, 24)
+        self.height = self.height - 2
         
         self.time = 0.0
         self.frame_count = 0
@@ -267,7 +267,7 @@ class ThinkingState:
         
         # Update width/height in case terminal was resized
         new_w, new_h = get_terminal_size()
-        self.width, self.height = new_w, min(new_h - 2, 24)
+        self.width, self.height = new_w, new_h - 2
     
     def render(self):
         """Render the complete thinking state animation."""
