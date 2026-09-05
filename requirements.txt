@@ -1,0 +1,2 @@
+# Iris - Terminal Animation for AI Activity Visualization
+# No external dependencies required - uses Python standard library only
