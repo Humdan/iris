@@ -36,8 +36,9 @@ echo "idle" > /tmp/iris_state
 ## Pi LCD / boot service
 
 `iris_fb.c` is a smooth per-pixel renderer for the framebuffer (`/dev/fb0`):
-a glowing eye that breathes when idle and contracts, spins and throws sparks
-when thinking. Multithreaded C, ~20-27 fps on a Pi 4 at 800x480, no X11.
+a neural-network / knowledge-graph of glowing nodes on black. Idle: slow drift,
+dim edges, the occasional lazy pulse. Thinking: pulses race along edges, nodes
+flare, the graph rewires. Multithreaded C, 30 fps on a Pi 4 at 800x480, no X11.
 
 ```bash
 make                    # builds ./iris_fb
