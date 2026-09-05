@@ -79,39 +79,60 @@ class AnimationEngine:
         """Run the main animation loop."""
         try:
             with terminal_context():
-                clear_screen()
-                
-                last_time = time.time()
-                
-                while self.running:
-                    current_time = time.time()
-                    delta_time = current_time - last_time
-                    last_time = current_time
+                if sys.stdin.isatty():
+                    # Full terminal control mode
+                    clear_screen()
                     
-                    # Check if terminal was resized
-                    new_w, new_h = get_terminal_size()
+                    last_time = time.time()
                     
-                    # Update animation
-                    self.update(delta_time)
-                    
-                    # Render
-                    move_cursor(1, 1)
-                    frame = self.render_frame()
-                    write_raw(frame)
-                    clear_to_end()
-                    
-                    # Wait for next frame
-                    time.sleep(self.frame_delay)
-                    
-                    # Check for keyboard input (non-blocking)
-                    self._handle_input()
+                    while self.running:
+                        current_time = time.time()
+                        delta_time = current_time - last_time
+                        last_time = current_time
+                        
+                        # Update animation
+                        self.update(delta_time)
+                        
+                        # Render
+                        move_cursor(1, 1)
+                        frame = self.render_frame()
+                        write_raw(frame)
+                        clear_to_end()
+                        
+                        # Wait for next frame
+                        time.sleep(self.frame_delay)
+                        
+                        # Check for keyboard input (non-blocking)
+                        self._handle_input()
+                else:
+                    # Non-terminal mode - just print frames
+                    self._run_non_terminal()
                     
         except KeyboardInterrupt:
             pass
         finally:
             show_cursor()
             reset_colors()
-            clear_screen()
+    
+    def _run_non_terminal(self):
+        """Run in non-terminal mode (for testing/debugging)."""
+        last_time = time.time()
+        frame_count = 0
+        max_frames = 3  # Limit frames in non-terminal mode
+        
+        while self.running and frame_count < max_frames:
+            current_time = time.time()
+            delta_time = current_time - last_time
+            last_time = current_time
+            
+            self.update(delta_time)
+            
+            frame = self.render_frame()
+            print(f"\033[2J\033[H{frame}")
+            
+            time.sleep(self.frame_delay)
+            frame_count += 1
+            self._handle_input()
     
     def _handle_input(self):
         """Handle keyboard input (non-blocking)."""

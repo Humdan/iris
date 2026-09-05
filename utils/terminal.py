@@ -130,9 +130,15 @@ def terminal_context():
         hide_cursor()
         signal.signal(signal.SIGWINCH, lambda s, f: None)  # Ignore resize interrupts
         yield
+    except termios.error:
+        # Handle non-terminal environments gracefully
+        yield
     finally:
         if old_settings:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            except termios.error:
+                pass
         show_cursor()
         reset_colors()
 
