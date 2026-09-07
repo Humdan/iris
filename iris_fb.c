@@ -193,7 +193,7 @@ int main(int argc, char **argv) {
             // brightness: base dim, gentle twinkle, lifts with activity, dims with depth
             float tw = 0.75f + 0.25f * sinf(p->twinkle);
             float bright = (0.18f + 0.55f * act) * tw * depth;
-            float rad = 1.0f + 0.8f * act + 0.6f * depth;
+            float rad = 1.6f + 1.0f * act + 0.8f * depth;
 
             // cyan idle -> slightly warmer (more green/white) when active
             float rr = bright * (0.05f + 0.35f * act);
