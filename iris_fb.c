@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
 
     srand(42);
     float ox = W * 0.5f, oy = H * 0.5f;
-    float scale = fminf(W, H) * 0.34f;
+    float scale = fminf(W, H) * 0.28f;
 
     // Seed particles uniformly on the shell (Fibonacci-ish) with slow drift.
     for (int i = 0; i < NPART; i++) {
@@ -165,12 +165,17 @@ int main(int argc, char **argv) {
         // drift speed scales gently with activity
         float drift = 0.5f + 1.3f * act;
 
-        // sphere expands when working: eased grow toward +18% at full activity.
-        // scale_dyn eases toward the target so growth/shrink is smooth, not snappy.
+        // Sphere expands when working AND breathes like a heartbeat.
+        //  - base growth: eases toward +35% at full activity (bigger than before)
+        //  - heartbeat: a periodic expand/contract, amplitude scales with activity
+        //    so idle barely breathes and thinking pulses clearly.
         static float scale_dyn = 1.0f;
-        float scale_target = 1.0f + 0.18f * act;
-        scale_dyn += (scale_target - scale_dyn) * (1.0f - expf(-2.5f * dt));
-        float escale = scale * scale_dyn;
+        float base_target = 1.0f + 0.35f * act;
+        scale_dyn += (base_target - scale_dyn) * (1.0f - expf(-2.5f * dt));
+        // heartbeat oscillation: ~0.28 Hz (a calm resting pulse), up to +/-12% at full act.
+        float beat = sinf(global_time * 1.8f);
+        float breathe = 1.0f + (0.02f + 0.12f * act) * beat;
+        float escale = scale * scale_dyn * breathe;
 
         // --- draw ---
         memset(back_raw, 0, fbsize);
