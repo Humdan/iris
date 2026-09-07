@@ -196,18 +196,22 @@ int main(int argc, char **argv) {
             nodes[i].energy *= expf(-dt * (1.0f + 1.8f * act));
         }
         
-        // Pattern-based firing
+        // Pattern-based firing — rate scales with activity.
+        // Idle (act~0): a slow, gentle blip every ~2.5s. Thinking (act~1): lively ~0.15s cascade.
         pattern_time += dt;
-        if (pattern_time > 0.15f) {
+        float fire_interval = 2.5f - 2.35f * act;   // 2.5s idle -> 0.15s active
+        if (pattern_time > fire_interval) {
             pattern_time = 0;
             pattern_idx = (pattern_idx + 1) % NNODES;
-            nodes[pattern_idx].energy = 1.0f;
-            fire(pattern_idx, -1, act);
-            
+            // Softer ignition when idle so nodes don't punch to full brightness.
+            nodes[pattern_idx].energy = 0.4f + 0.6f * act;
+            // Only send travelling pulses once there's real activity.
+            if (act > 0.15f) fire(pattern_idx, -1, act);
+
             if (act > 0.3f) {
                 Node *n = &nodes[pattern_idx];
                 for (int q = 0; q < n->deg; q++) {
-                    nodes[n->e[q].to].energy = 0.6f;
+                    nodes[n->e[q].to].energy = 0.6f * act;
                 }
             }
         }
