@@ -1,33 +1,22 @@
-// iris_fb.c — neural network / knowledge-graph animation for the Pi framebuffer.
-//
-// Nodes drift on a black field, linked by edges to their neighbours.
-// Idle:     slow drift, dim edges, an occasional lazy pulse.
-// Thinking: nodes flare, pulses race along edges, the graph rewires and churns.
-// State file (default /tmp/iris_state) holds an activity level 0.0-1.0 — the
-// graph's firing rate, drift and brightness scale continuously with it.
-// The words "thinking" (=1) and "idle" (=0) are also accepted.
-//
-// build: make   (gcc -O2 -ffast-math iris_fb.c -lm -lpthread)
+// iris_fb.c — smooth neural network with gentle continuous rotation
 
 #include <fcntl.h>
 #include <linux/fb.h>
 #include <math.h>
-#include <pthread.h>
-#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <time.h>
+#include <signal.h>
 #include <unistd.h>
+#include <time.h>
 
-#define NTHREADS 4
-#define NNODES 64
-#define MAXDEG 4
-#define NPULSE 160
-#define LINK_DIST 0.42f      // in normalised units (half-height = 1)
+#define NNODES 80
+#define MAXDEG 5
+#define NPULSE 48
+#define NTRAILS 128
 
 static volatile int running = 1;
 static void on_sig(int s) { (void)s; running = 0; }
@@ -36,313 +25,311 @@ static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ?
 static float frand(void) { return rand() / (float)RAND_MAX; }
 static float smoothstep(float e0, float e1, float x) { float t = clampf((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); }
 
-// ---------- framebuffer + float accumulation buffer ----------
-static int W, H, BPP, STRIDE;
-static float *acc;   // RGB float accumulation, W*H*3
-
-static inline void add_px(int x, int y, float r, float g, float b) {
-    if ((unsigned)x >= (unsigned)W || (unsigned)y >= (unsigned)H) return;
-    float *p = acc + ((size_t)y * W + x) * 3; p[0] += r; p[1] += g; p[2] += b;
-}
-
-// soft round dot with gaussian-ish falloff
-static void dot(float cx, float cy, float rad, float r, float g, float b) {
-    int x0 = (int)(cx - rad - 1), x1 = (int)(cx + rad + 1), y0 = (int)(cy - rad - 1), y1 = (int)(cy + rad + 1);
-    float inv = 1.0f / (rad * rad);
-    for (int y = y0; y <= y1; y++) for (int x = x0; x <= x1; x++) {
-        float dx = x + 0.5f - cx, dy = y + 0.5f - cy, d2 = (dx * dx + dy * dy) * inv;
-        if (d2 > 1.0f) continue;
-        float k = (1 - d2); k *= k;
-        add_px(x, y, r * k, g * k, b * k);
-    }
-}
-
-// anti-aliased soft line of given half-width
-static void line(float x0, float y0, float x1, float y1, float hw, float r, float g, float b) {
-    float dx = x1 - x0, dy = y1 - y0, len = sqrtf(dx * dx + dy * dy);
-    if (len < 1) return;
-    int steps = (int)(len / 0.9f) + 1;
-    float sx = dx / steps, sy = dy / steps;
-    float px = x0, py = y0;
-    for (int i = 0; i <= steps; i++, px += sx, py += sy) {
-        int ix = (int)px, iy = (int)py;
-        int R = (int)hw + 1;
-        for (int yy = -R; yy <= R; yy++) for (int xx = -R; xx <= R; xx++) {
-            float ex = ix + xx + 0.5f - px, ey = iy + yy + 0.5f - py;
-            float d = sqrtf(ex * ex + ey * ey) - hw;
-            float k = d <= 0 ? 1.0f : d >= 1.0f ? 0.0f : 1.0f - d;
-            if (k <= 0) continue;
-            add_px(ix + xx, iy + yy, r * k * 0.55f, g * k * 0.55f, b * k * 0.55f);
-        }
-    }
-}
-
-// ---------- background nebula, rendered in threads ----------
-struct Job { int y0, y1; float T, think; };
-
-static float hash2(int x, int y) { uint32_t h = (uint32_t)x * 374761393u + (uint32_t)y * 668265263u; h = (h ^ (h >> 13)) * 1274126177u; return (h ^ (h >> 16)) / 4294967296.0f; }
-static float vnoise(float x, float y) {           // value noise
-    int xi = (int)floorf(x), yi = (int)floorf(y); float fx = x - xi, fy = y - yi;
-    fx = fx * fx * (3 - 2 * fx); fy = fy * fy * (3 - 2 * fy);
-    float a = hash2(xi, yi), b = hash2(xi + 1, yi), c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
-    return (a + (b - a) * fx) * (1 - fy) + (c + (d - c) * fx) * fy;
-}
-
-#define NEB 4                       // nebula downscale factor
-static int NW, NH; static float *neb;   // low-res nebula, NW*NH*3
-
-static void *nebula(void *arg) {
-    struct Job *j = arg; float T = j->T, th = j->think;
-    float sc = 2.6f / NH;
-    for (int y = j->y0; y < j->y1; y++) {
-        float *row = neb + (size_t)y * NW * 3;
-        for (int x = 0; x < NW; x++) {
-            float nx = x * sc, ny = y * sc;
-            float n = vnoise(nx + T * 0.05f, ny - T * 0.03f) * 0.6f
-                    + vnoise(nx * 2.1f - T * 0.08f, ny * 2.1f + T * 0.05f) * 0.3f
-                    + vnoise(nx * 4.3f + T * (0.1f + 0.6f * th), ny * 4.3f) * 0.1f * (1 + 2 * th);
-            n = n * n;                                 // darken
-            float k = 0.22f + 0.18f * th;
-            // vignette
-            float vx = (x - NW * 0.5f) / (NW * 0.5f), vy = (y - NH * 0.5f) / (NH * 0.5f);
-            float vig = 1.0f - 0.55f * (vx * vx + vy * vy);
-            k *= vig > 0 ? vig : 0;
-            row[x * 3 + 0] = n * k * 40;
-            row[x * 3 + 1] = n * k * 110;
-            row[x * 3 + 2] = n * k * 170;
-        }
-    }
-    return NULL;
-}
-
-static void *upscale(void *arg) {
-    struct Job *j = arg;
-    for (int y = j->y0; y < j->y1; y++) {
-        float fy = (y + 0.5f) / NEB - 0.5f; int y0 = (int)fy; float ty = fy - y0; if (y0 < 0) { y0 = 0; ty = 0; } int y1 = y0 + 1 < NH ? y0 + 1 : y0;
-        float *row = acc + (size_t)y * W * 3;
-        for (int x = 0; x < W; x++) {
-            float fx = (x + 0.5f) / NEB - 0.5f; int x0 = (int)fx; float tx = fx - x0; if (x0 < 0) { x0 = 0; tx = 0; } int x1 = x0 + 1 < NW ? x0 + 1 : x0;
-            float *a = neb + ((size_t)y0 * NW + x0) * 3, *b = neb + ((size_t)y0 * NW + x1) * 3, *c = neb + ((size_t)y1 * NW + x0) * 3, *d = neb + ((size_t)y1 * NW + x1) * 3;
-            for (int k = 0; k < 3; k++) row[x * 3 + k] = (a[k] + (b[k] - a[k]) * tx) * (1 - ty) + (c[k] + (d[k] - c[k]) * tx) * ty;
-        }
-    }
-    return NULL;
-}
-
-// tonemap LUT: input 0..2047 -> 0..255 soft clip
-static uint8_t tmap[2048];
-struct TJob { int y0, y1; uint8_t *back; };
-static void *tonemap(void *arg) {
-    struct TJob *j = arg;
-    for (int y = j->y0; y < j->y1; y++) {
-        uint8_t *row = j->back + (size_t)y * STRIDE; float *src = acc + (size_t)y * W * 3;
-        for (int x = 0; x < W; x++) {
-            int ri = (int)src[x * 3], gi = (int)src[x * 3 + 1], bi = (int)src[x * 3 + 2];
-            uint8_t r8 = tmap[ri > 2047 ? 2047 : ri < 0 ? 0 : ri], g8 = tmap[gi > 2047 ? 2047 : gi < 0 ? 0 : gi], b8 = tmap[bi > 2047 ? 2047 : bi < 0 ? 0 : bi];
-            if (BPP == 16) ((uint16_t *)row)[x] = (uint16_t)(((r8 >> 3) << 11) | ((g8 >> 2) << 5) | (b8 >> 3));
-            else ((uint32_t *)row)[x] = 0xFF000000u | (r8 << 16) | (g8 << 8) | b8;
-        }
-    }
-    return NULL;
-}
-
-// ---------- graph ----------
-#define MAXEDGE 8            // slots per node: active neighbours + fading-out ones
-typedef struct { int to; float w, target; } Edge;
-typedef struct { float x, y, vx, vy, phase, energy, etarget, size; int deg; Edge e[MAXEDGE]; } Node;
+typedef struct { int to; } Edge;
+typedef struct { float px, py; float base_x, base_y, base_z; float energy; int deg; Edge e[MAXDEG]; } Node;
 typedef struct { int a, b; float t, spd, alive; } Pulse;
+typedef struct { float x, y, vx, vy, life; } Trail;
 
-static Node nodes[NNODES]; static Pulse pulses[NPULSE];
+static Node nodes[NNODES];
+static Pulse pulses[NPULSE];
+static Trail trails[NTRAILS];
 
-static void rewire(void) {
-    for (int i = 0; i < NNODES; i++) {
-        Node *n = &nodes[i];
-        int want[MAXDEG], nw = 0;
-        for (int k = 0; k < MAXDEG; k++) {
-            int best = -1; float bd = LINK_DIST * LINK_DIST;
-            for (int j = 0; j < NNODES; j++) {
-                if (j == i) continue;
-                int dup = 0; for (int q = 0; q < nw; q++) if (want[q] == j) dup = 1;
-                if (dup) continue;
-                float dx = n->x - nodes[j].x, dy = n->y - nodes[j].y, d = dx * dx + dy * dy;
-                if (d < bd) { bd = d; best = j; }
-            }
-            if (best < 0) break;
-            want[nw++] = best;
-        }
-        // existing edges: keep if wanted, else fade out
-        for (int q = 0; q < n->deg; q++) {
-            int keep = 0; for (int k = 0; k < nw; k++) if (want[k] == n->e[q].to) keep = 1;
-            n->e[q].target = keep ? 1.0f : 0.0f;
-        }
-        // wanted edges not present: add fading in (reuse a dead slot or append)
-        for (int k = 0; k < nw; k++) {
-            int have = 0; for (int q = 0; q < n->deg; q++) if (n->e[q].to == want[k]) have = 1;
-            if (have) continue;
-            int slot = -1;
-            for (int q = 0; q < n->deg; q++) if (n->e[q].w < 0.02f && n->e[q].target == 0) { slot = q; break; }
-            if (slot < 0 && n->deg < MAXEDGE) slot = n->deg++;
-            if (slot >= 0) n->e[slot] = (Edge){ want[k], 0.0f, 1.0f };
-        }
-    }
-}
-
-static void ease_edges(float dt) {
-    float k = clampf(dt * 2.2f, 0, 1);                       // ~0.7s fade
-    for (int i = 0; i < NNODES; i++) {
-        Node *n = &nodes[i];
-        for (int q = 0; q < n->deg; q++) n->e[q].w += (n->e[q].target - n->e[q].w) * k;
-        // compact fully-faded trailing slots
-        while (n->deg > 0 && n->e[n->deg - 1].target == 0 && n->e[n->deg - 1].w < 0.01f) n->deg--;
-    }
-}
-
-static void fire(int from, float think) {
+static void fire(int from, int avoid, float act) {
     Node *n = &nodes[from];
-    int live[MAXEDGE], nl = 0;
-    for (int q = 0; q < n->deg; q++) if (n->e[q].w > 0.5f) live[nl++] = n->e[q].to;
+    int live[MAXDEG], nl = 0;
+    for (int q = 0; q < n->deg; q++) if (n->e[q].to != avoid) live[nl++] = n->e[q].to;
     if (nl == 0) return;
     for (int i = 0; i < NPULSE; i++) if (pulses[i].alive <= 0) {
-        pulses[i] = (Pulse){ from, live[rand() % nl], 0, 0.9f + frand() * 0.8f + 2.5f * think, 1.0f };
+        pulses[i] = (Pulse){ from, live[rand() % nl], 0, 0.35f + frand() * 0.25f + 1.2f * act, 1.0f };
         return;
+    }
+}
+
+static inline void blend_pixel_16(uint16_t *p, float r, float g, float b) {
+    uint16_t rv = (uint16_t)(r * 31.0f) & 0x1F;
+    uint16_t gv = (uint16_t)(g * 63.0f) & 0x3F;
+    uint16_t bv = (uint16_t)(b * 31.0f) & 0x1F;
+    
+    uint16_t cr = (*p >> 11) & 0x1F;
+    uint16_t cg = (*p >> 5) & 0x3F;
+    uint16_t cb = *p & 0x1F;
+    
+    cr = (cr + rv) > 0x1F ? 0x1F : cr + rv;
+    cg = (cg + gv) > 0x3F ? 0x3F : cg + gv;
+    cb = (cb + bv) > 0x1F ? 0x1F : cb + bv;
+    
+    *p = (cr << 11) | (cg << 5) | cb;
+}
+
+static void dot_16(uint16_t *fb, int W, int H, int STRIDE, float cx, float cy, float rad, float r, float g, float b) {
+    int x0 = (int)(cx - rad), x1 = (int)(cx + rad + 1), y0 = (int)(cy - rad), y1 = (int)(cy + rad + 1);
+    float inv = 1.0f / (rad * rad + 0.1f);
+    for (int y = y0; y <= y1; y++) {
+        if (y < 0 || y >= H) continue;
+        uint16_t *row = fb + y * (STRIDE / 2);
+        for (int x = x0; x <= x1; x++) {
+            if (x < 0 || x >= W) continue;
+            float dx = x - cx, dy = y - cy, d2 = (dx * dx + dy * dy) * inv;
+            if (d2 > 1.0f) continue;
+            float k = (1 - d2); k *= k * k;
+            blend_pixel_16(&row[x], r * k, g * k, b * k);
+        }
+    }
+}
+
+static void line_16(uint16_t *fb, int W, int H, int STRIDE, float x0, float y0, float x1, float y1, float r, float g, float b) {
+    float dx = x1 - x0, dy = y1 - y0;
+    float dist = sqrtf(dx*dx + dy*dy);
+    if (dist < 1.0f) return;
+    int steps = (int)(dist * 1.5f) + 1;
+    float step_x = dx / steps, step_y = dy / steps;
+    for (int i = 0; i <= steps; i++) {
+        float x = x0 + step_x * i;
+        float y = y0 + step_y * i;
+        int ix = (int)x, iy = (int)y;
+        if (ix >= 0 && ix < W && iy >= 0 && iy < H) {
+            blend_pixel_16(&fb[iy * (STRIDE / 2) + ix], r, g, b);
+        }
     }
 }
 
 int main(int argc, char **argv) {
     const char *state_file = argc > 1 ? argv[1] : "/tmp/iris_state";
-    signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
-
-    int fd = open("/dev/fb0", O_RDWR); if (fd < 0) { perror("open /dev/fb0"); return 1; }
-    struct fb_var_screeninfo v; struct fb_fix_screeninfo f;
-    ioctl(fd, FBIOGET_VSCREENINFO, &v); ioctl(fd, FBIOGET_FSCREENINFO, &f);
-    W = v.xres; H = v.yres; BPP = v.bits_per_pixel; STRIDE = f.line_length;
-    size_t fbsize = (size_t)STRIDE * v.yres_virtual;
-    uint8_t *fb = mmap(NULL, fbsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (fb == MAP_FAILED) { perror("mmap"); return 1; }
+    signal(SIGINT, on_sig); 
+    signal(SIGTERM, on_sig);
+    
+    int fd = open("/dev/fb0", O_RDWR); 
+    if (fd < 0) { perror("open /dev/fb0"); return 1; }
+    
+    struct fb_var_screeninfo v; 
+    struct fb_fix_screeninfo f;
+    ioctl(fd, FBIOGET_VSCREENINFO, &v); 
+    ioctl(fd, FBIOGET_FSCREENINFO, &f);
+    
+    int W = v.xres; 
+    int H = v.yres; 
+    int BPP = v.bits_per_pixel; 
+    int STRIDE = f.line_length;
+    
+    size_t fbsize = (size_t)STRIDE * H;
+    uint8_t *fb_raw = mmap(NULL, fbsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (fb_raw == MAP_FAILED) { perror("mmap"); return 1; }
+    
+    uint16_t *fb = (uint16_t *)fb_raw;
+    uint8_t *back_raw = malloc(fbsize);
+    uint16_t *back = (uint16_t *)back_raw;
+    
     fprintf(stderr, "iris_fb: %dx%d %dbpp stride %d\n", W, H, BPP, STRIDE);
-    uint8_t *back = malloc((size_t)STRIDE * H);
-    acc = malloc(sizeof(float) * W * H * 3);
-    NW = W / NEB; NH = H / NEB; neb = malloc(sizeof(float) * NW * NH * 3);
-    for (int i = 0; i < 2048; i++) tmap[i] = (uint8_t)(255 * (1 - expf(-i / 200.0f)));
-
-    float aspect = (float)W / H;                 // normalised coords: x in [-aspect,aspect], y in [-1,1]
-    srand(11);
+    
+    // Initialize nodes on sphere
+    srand(42);
+    float ox = W * 0.5f, oy = H * 0.5f;
+    float scale = fminf(W, H) * 0.32f;
+    
     for (int i = 0; i < NNODES; i++) {
-        nodes[i] = (Node){ (frand() * 2 - 1) * aspect * 0.95f, (frand() * 2 - 1) * 0.92f,
-                           0, 0, frand() * 6.28f, 0, 0, 2.2f + frand() * 2.5f, 0, {{0}} };
+        float phi = acosf(1.0f - 2.0f * i / (float)NNODES);
+        float theta = 3.14159f * (1.0f + sqrtf(5.0f)) * i;
+        nodes[i].base_x = sinf(phi) * cosf(theta);
+        nodes[i].base_y = cosf(phi);
+        nodes[i].base_z = sinf(phi) * sinf(theta);
+        nodes[i].px = ox + nodes[i].base_x * scale;
+        nodes[i].py = oy + nodes[i].base_y * scale;
+        nodes[i].energy = 0;
+        nodes[i].deg = 0;
     }
-    rewire();
-
-    float think = 0, target = 0; double t0 = now(), tlast = t0, tcheck = 0, trewire = 0, tfps = t0; int frames = 0;
-    float fire_acc = 0; double next_frame = now();
-
+    
+    // Build denser edges
+    for (int i = 0; i < NNODES; i++) {
+        float dists[NNODES];
+        for (int j = 0; j < NNODES; j++) {
+            if (i == j) { dists[j] = 1e9; continue; }
+            float dx = nodes[j].px - nodes[i].px;
+            float dy = nodes[j].py - nodes[i].py;
+            dists[j] = dx*dx + dy*dy;
+        }
+        for (int k = 0; k < MAXDEG && nodes[i].deg < MAXDEG; k++) {
+            int best = -1; float bd = 1e9;
+            for (int j = 0; j < NNODES; j++) {
+                if (dists[j] < bd) { bd = dists[j]; best = j; }
+            }
+            if (best < 0) break;
+            nodes[i].e[nodes[i].deg++] = (Edge){ best };
+            dists[best] = 1e9;
+        }
+    }
+    
+    for (int i = 0; i < NTRAILS; i++) trails[i].life = 0;
+    
+    float act = 0, target = 0;
+    double t0 = now(), tlast = t0, tcheck = 0, tfps = t0;
+    int frames = 0;
+    float pattern_time = 0;
+    int pattern_idx = 0;
+    float global_time = 0;
+    
     while (running) {
-        double t = now(); float dt = (float)(t - tlast); tlast = t; if (dt > 0.1f) dt = 0.1f;
-        if (t - tcheck > 0.15) {
-            tcheck = t; FILE *sf = fopen(state_file, "r");
+        double t = now(); 
+        float dt = (float)(t - tlast); 
+        tlast = t; 
+        if (dt > 0.05f) dt = 0.05f;
+        
+        global_time += dt;
+        
+        if (t - tcheck > 0.1) {
+            tcheck = t; 
+            FILE *sf = fopen(state_file, "r");
             if (sf) {
                 char buf[64] = {0};
                 if (fgets(buf, 63, sf)) {
                     if (strncmp(buf, "thinking", 8) == 0) target = 1.0f;
                     else if (strncmp(buf, "idle", 4) == 0) target = 0.0f;
-                    else { char *end; float v = strtof(buf, &end); target = end != buf ? clampf(v, 0, 1) : 0.0f; }
+                    else { char *end; float x = strtof(buf, &end); target = end != buf ? clampf(x, 0, 1) : 0.0f; }
                 }
                 fclose(sf);
             }
         }
-        think += (target - think) * clampf((target > think ? 4.0f : 1.5f) * dt, 0, 1);
-        float T = (float)(t - t0);
-
-        // --- physics: drift + gentle spring to neighbours + repulsion ---
-        float drift = 0.02f + 0.10f * think;
+        
+        act += (target - act) * (1.0f - expf(-(target > act ? 4.0f : 0.8f) * dt));
+        
+        // Update energy
         for (int i = 0; i < NNODES; i++) {
-            Node *n = &nodes[i];
-            float ax = sinf(T * 0.31f + n->phase) * drift + cosf(T * 0.17f + n->phase * 1.7f) * drift * 0.6f;
-            float ay = cosf(T * 0.27f + n->phase * 1.3f) * drift;
-            for (int q = 0; q < n->deg; q++) {            // spring to neighbours, weighted by edge strength
-                Node *m = &nodes[n->e[q].to]; float dx = m->x - n->x, dy = m->y - n->y, d = sqrtf(dx * dx + dy * dy) + 1e-4f;
-                float k = (d - 0.30f) * 0.5f * n->e[q].w; ax += dx / d * k; ay += dy / d * k;
-            }
-            for (int j = 0; j < NNODES; j++) if (j != i) {     // short-range repulsion
-                float dx = n->x - nodes[j].x, dy = n->y - nodes[j].y, d2 = dx * dx + dy * dy;
-                if (d2 < 0.07f) { float k = (0.07f - d2) * 6.0f; ax += dx * k; ay += dy * k; }
-            }
-            // stay on screen
-            ax -= n->x * 0.03f * (fabsf(n->x) > aspect * 0.85f ? 12 : 1);
-            ay -= n->y * 0.03f * (fabsf(n->y) > 0.85f ? 12 : 1);
-            n->vx = (n->vx + ax * dt) * 0.97f; n->vy = (n->vy + ay * dt) * 0.97f;
-            n->x += n->vx * dt; n->y += n->vy * dt;
-            n->x = clampf(n->x, -aspect * 0.95f, aspect * 0.95f); n->y = clampf(n->y, -0.93f, 0.93f);
-            n->etarget *= expf(-dt * (1.8f + 1.5f * think));
-            n->energy += (n->etarget - n->energy) * clampf(dt * 18.0f, 0, 1);
+            nodes[i].energy *= expf(-dt * (1.0f + 1.8f * act));
         }
-        if (t - trewire > (2.5 - 2.0 * think)) { trewire = t; rewire(); }
-        ease_edges(dt);
-
-        // --- fire pulses: rate scales hard with thinking ---
-        fire_acc += dt * (0.5f + 6.0f * think + 12.0f * think * think);
-        while (fire_acc >= 1) { fire_acc -= 1; fire(rand() % NNODES, think); }
+        
+        // Pattern-based firing
+        pattern_time += dt;
+        if (pattern_time > 0.15f) {
+            pattern_time = 0;
+            pattern_idx = (pattern_idx + 1) % NNODES;
+            nodes[pattern_idx].energy = 1.0f;
+            fire(pattern_idx, -1, act);
+            
+            if (act > 0.3f) {
+                Node *n = &nodes[pattern_idx];
+                for (int q = 0; q < n->deg; q++) {
+                    nodes[n->e[q].to].energy = 0.6f;
+                }
+            }
+        }
+        
+        // Propagate pulses
         for (int i = 0; i < NPULSE; i++) {
-            Pulse *p = &pulses[i]; if (p->alive <= 0) continue;
+            Pulse *p = &pulses[i]; 
+            if (p->alive <= 0) continue;
             p->t += dt * p->spd;
-            if (p->t >= 1) {                              // arrive: light node, maybe propagate
-                p->alive = 0; nodes[p->b].etarget = 1.0f;
-                if (frand() < 0.25f + 0.55f * think) fire(p->b, think);
+            if (p->t >= 1) {
+                p->alive = 0; 
+                nodes[p->b].energy = 1.0f;
+                if (frand() < 0.3f + 0.6f * act) fire(p->b, p->a, act);
             }
         }
-
-        // --- render ---
-        pthread_t th[NTHREADS];
-        memset(acc, 0, sizeof(float) * W * H * 3);   // solid black background
-
-        float sx = H * 0.5f, ox = W * 0.5f, oy = H * 0.5f;   // to pixels
-        #define PX(n) (ox + (n).x * sx)
-        #define PY(n) (oy + (n).y * sx)
-
-        // edges (weight w fades in/out over rewires)
-        float eb = 0.30f + 0.15f * think;
-        for (int i = 0; i < NNODES; i++) for (int q = 0; q < nodes[i].deg; q++) {
-            int j = nodes[i].e[q].to; float w = nodes[i].e[q].w; if (w < 0.01f) continue;
-            if (j < i) {   // if j also links to i, draw once from the lower index with the stronger weight
-                for (int qq = 0; qq < nodes[j].deg; qq++) if (nodes[j].e[qq].to == i && nodes[j].e[qq].w >= w) { w = -1; break; }
-                if (w < 0) continue;
-            }
-            float e = clampf(nodes[i].energy + nodes[j].energy, 0, 1);
-            float k = eb * (0.35f + 0.65f * e) * w;
-            line(PX(nodes[i]), PY(nodes[i]), PX(nodes[j]), PY(nodes[j]), 0.6f + 0.6f * e, 20 * k + 60 * e * w, 120 * k + 160 * e * w, 170 * k + 200 * e * w);
+        
+        // Update trails
+        for (int i = 0; i < NTRAILS; i++) {
+            if (trails[i].life <= 0) continue;
+            trails[i].x += trails[i].vx * dt;
+            trails[i].y += trails[i].vy * dt;
+            trails[i].vx *= 0.92f;
+            trails[i].vy *= 0.92f;
+            trails[i].life -= dt * 3.0f;
         }
-        // pulses travelling along edges
+        
+        // Spawn trails
         for (int i = 0; i < NPULSE; i++) {
-            Pulse *p = &pulses[i]; if (p->alive <= 0) continue;
-            float x = PX(nodes[p->a]) + (PX(nodes[p->b]) - PX(nodes[p->a])) * p->t;
-            float y = PY(nodes[p->a]) + (PY(nodes[p->b]) - PY(nodes[p->a])) * p->t;
-            float fade = smoothstep(0, 0.15f, p->t) * (1 - smoothstep(0.85f, 1.0f, p->t));
-            dot(x, y, 4.5f + 3.0f * think, 160 * fade, 240 * fade, 255 * fade);
-            dot(x, y, 11.0f, 20 * fade, 70 * fade, 110 * fade);   // halo
+            Pulse *p = &pulses[i];
+            if (p->alive <= 0) continue;
+            if (frand() < 0.3f) {
+                for (int j = 0; j < NTRAILS; j++) {
+                    if (trails[j].life <= 0) {
+                        float x = nodes[p->a].px + (nodes[p->b].px - nodes[p->a].px) * p->t;
+                        float y = nodes[p->a].py + (nodes[p->b].py - nodes[p->a].py) * p->t;
+                        trails[j] = (Trail){ x, y, (frand()-0.5f)*30, (frand()-0.5f)*30, 1.0f };
+                        break;
+                    }
+                }
+            }
         }
-        // nodes
+        
+        // Smooth eased forward/back rotation on Y axis.
+        // Angle sweeps ~30s one way then ~30s back, eased so direction never snaps.
+        // period = 60s round trip; phase in [0,1); smootherstep gives zero-velocity turns.
+        float period = 60.0f;
+        float phase = fmodf(global_time, period) / period;   // 0..1
+        float tri = phase < 0.5f ? phase * 2.0f : (1.0f - phase) * 2.0f;  // 0..1..0
+        float eased = tri * tri * tri * (tri * (tri * 6.0f - 15.0f) + 10.0f); // smootherstep
+        float rot_angle = eased * 6.2831853f;   // full turn each direction
+        float cos_a = cosf(rot_angle);
+        float sin_a = sinf(rot_angle);
+
         for (int i = 0; i < NNODES; i++) {
-            Node *n = &nodes[i]; float e = n->energy;
-            float br = 0.35f + 0.25f * sinf(T * 0.8f + n->phase) + 0.2f * think;
-            float rad = n->size * (1 + 0.15f * think) + 3.0f * e;
-            dot(PX(*n), PY(*n), rad * 3.2f, 8 * br + 25 * e, 40 * br + 90 * e, 70 * br + 130 * e);          // glow
-            dot(PX(*n), PY(*n), rad, 90 * br + 160 * e, 200 * br + 60 * e, 235 * br + 20 * e);              // core
-            if (e > 0.05f) dot(PX(*n), PY(*n), rad * 0.55f, 200 * e, 255 * e, 255 * e);                     // white-hot flash
+            // Proper Y-axis rotation: x/z rotate, y is the axis and stays fixed.
+            float x = nodes[i].base_x;
+            float z = nodes[i].base_z;
+            float x_rot = x * cos_a + z * sin_a;
+            float z_rot = -x * sin_a + z * cos_a;
+
+            // Perspective-ish depth: nodes toward viewer (z_rot>0) slightly larger.
+            float depth = 0.85f + 0.15f * z_rot;   // 0.70..1.00
+            nodes[i].px = ox + x_rot * scale * depth;
+            nodes[i].py = oy + nodes[i].base_y * scale * depth;
         }
-
-        struct TJob tj[NTHREADS];
-        for (int i = 0; i < NTHREADS; i++) { tj[i] = (struct TJob){ i * H / NTHREADS, (i + 1) * H / NTHREADS, back }; pthread_create(&th[i], NULL, tonemap, &tj[i]); }
-        for (int i = 0; i < NTHREADS; i++) pthread_join(th[i], NULL);
-        // pace on an absolute 30 Hz clock, then blit the whole frame in one go
-        next_frame += 1.0 / 30.0;
-        double wait = next_frame - now();
-        if (wait > 0) usleep((useconds_t)(wait * 1e6));
-        else if (wait < -0.1) next_frame = now();          // fell far behind: resync
-        memcpy(fb, back, (size_t)STRIDE * H);
-
-        frames++; if (t - tfps > 5) { fprintf(stderr, "fps %.1f think %.2f\n", frames / (t - tfps), think); frames = 0; tfps = t; }
+        
+        // Clear back
+        memset(back_raw, 0, fbsize);
+        
+        // Draw edges only - minimal
+        for (int i = 0; i < NNODES; i++) {
+            for (int q = 0; q < nodes[i].deg; q++) {
+                int j = nodes[i].e[q].to;
+                if (j < i) continue;
+                float glow = nodes[i].energy * 0.3f + nodes[j].energy * 0.3f;
+                float b = 0.1f + glow * 0.5f;
+                line_16(back, W, H, STRIDE, nodes[i].px, nodes[i].py, nodes[j].px, nodes[j].py,
+                       0.01f, 0.05f + glow * 0.2f, b);
+            }
+        }
+        
+        // Draw pulses - clean bright lines
+        for (int i = 0; i < NPULSE; i++) {
+            Pulse *p = &pulses[i]; 
+            if (p->alive <= 0) continue;
+            float x = nodes[p->a].px + (nodes[p->b].px - nodes[p->a].px) * p->t;
+            float y = nodes[p->a].py + (nodes[p->b].py - nodes[p->a].py) * p->t;
+            float fade = smoothstep(0, 0.1f, p->t) * (1 - smoothstep(0.9f, 1.0f, p->t));
+            dot_16(back, W, H, STRIDE, x, y, 4.0f + 3.0f * fade, 0.5f*fade, 0.8f*fade, fade);
+        }
+        
+        // Draw nodes - clean minimal glow
+        for (int i = 0; i < NNODES; i++) {
+            float e = nodes[i].energy;
+            
+            // Outer faint glow
+            dot_16(back, W, H, STRIDE, nodes[i].px, nodes[i].py, 6.0f + 4.0f * e,
+                  0.02f, 0.08f + 0.2f * e, 0.12f + 0.3f * e);
+            
+            // Core - bright cyan when active
+            float core = 2.0f + 1.5f * e;
+            dot_16(back, W, H, STRIDE, nodes[i].px, nodes[i].py, core,
+                  0.1f + 0.2f * e, 0.4f + 0.5f * e, 0.6f + 0.4f * e);
+        }
+        
+        // Blit
+        memcpy(fb_raw, back_raw, fbsize);
+        
+        frames++;
+        if (t - tfps > 5) {
+            fprintf(stderr, "fps %.1f act %.2f\n", frames / (t - tfps), act);
+            frames = 0;
+            tfps = t;
+        }
+        
+        usleep(16667);
     }
-    memset(fb, 0, (size_t)STRIDE * H);
-    munmap(fb, fbsize); close(fd); free(back); free(acc); free(neb);
+    
+    fprintf(stderr, "iris_fb: shutting down\n");
+    memset(fb_raw, 0, fbsize);
+    free(back_raw);
+    munmap(fb_raw, fbsize); 
+    close(fd);
     return 0;
 }
