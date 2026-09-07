@@ -165,6 +165,13 @@ int main(int argc, char **argv) {
         // drift speed scales gently with activity
         float drift = 0.5f + 1.3f * act;
 
+        // sphere expands when working: eased grow toward +18% at full activity.
+        // scale_dyn eases toward the target so growth/shrink is smooth, not snappy.
+        static float scale_dyn = 1.0f;
+        float scale_target = 1.0f + 0.18f * act;
+        scale_dyn += (scale_target - scale_dyn) * (1.0f - expf(-2.5f * dt));
+        float escale = scale * scale_dyn;
+
         // --- draw ---
         memset(back_raw, 0, fbsize);
         uint16_t *back = (uint16_t *)back_raw;
@@ -187,17 +194,17 @@ int main(int argc, char **argv) {
             float zr = -sx * sr + sz * cr;
 
             float depth = 0.80f + 0.20f * zr;   // 0.6..1.0, front = brighter/bigger
-            float px = ox + xr * scale * depth;
-            float py = oy + sy * scale * depth;
+            float px = ox + xr * escale * depth;
+            float py = oy + sy * escale * depth;
 
-            // brightness: base dim, gentle twinkle, lifts with activity, dims with depth
+            // brightness: brighter baseline, gentle twinkle, lifts with activity, dims with depth
             float tw = 0.75f + 0.25f * sinf(p->twinkle);
-            float bright = (0.18f + 0.55f * act) * tw * depth;
+            float bright = (0.62f + 0.38f * act) * tw * depth;
             float rad = 1.6f + 1.0f * act + 0.8f * depth;
 
             // cyan idle -> slightly warmer (more green/white) when active
             float rr = bright * (0.05f + 0.35f * act);
-            float gg = bright * (0.55f + 0.35f * act);
+            float gg = bright * (0.70f + 0.25f * act);
             float bb = bright * (0.90f);
             dot_16(back, W, H, STRIDE, px, py, rad, rr, gg, bb);
         }
@@ -218,8 +225,8 @@ int main(int argc, char **argv) {
             float xr = s->x * cr + s->z * sr;
             float zr = -s->x * sr + s->z * cr;
             float depth = 0.80f + 0.20f * zr;
-            float px = ox + xr * scale * depth;
-            float py = oy + s->y * scale * depth;
+            float px = ox + xr * escale * depth;
+            float py = oy + s->y * escale * depth;
             float fade = smoothstep(0, 0.2f, s->life);
             dot_16(back, W, H, STRIDE, px, py, 2.0f + 2.0f * fade,
                    0.5f * fade, 0.8f * fade, 1.0f * fade);
