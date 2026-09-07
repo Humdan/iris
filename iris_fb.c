@@ -27,6 +27,23 @@ static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ?
 static float frand(void) { return rand() / (float)RAND_MAX; }
 static float smoothstep(float e0, float e1, float x) { float t = clampf((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); }
 
+// Cardiac lub-dub envelope over a normalized phase [0,1): a strong first beat
+// (lub), a quick smaller second beat (dub), then a resting baseline. Returns
+// roughly [-0.35, 1.0]; multiply by amplitude. Two raised-cosine bumps + a
+// gentle diastolic dip so it reads as a real heartbeat, not a sine.
+static float heartbeat(float ph) {
+    ph -= floorf(ph);
+    float lub = 0.0f, dub = 0.0f;
+    // lub: bump centered ~0.10, width ~0.09
+    if (ph > 0.01f && ph < 0.19f) { float u = (ph - 0.01f) / 0.18f; lub = 0.5f - 0.5f * cosf(u * 6.2831853f); }
+    // dub: smaller bump centered ~0.30, width ~0.07
+    if (ph > 0.24f && ph < 0.38f) { float u = (ph - 0.24f) / 0.14f; dub = 0.45f * (0.5f - 0.5f * cosf(u * 6.2831853f)); }
+    float pulse = lub + dub;
+    // slight contraction (dip) during the long rest so it visibly pulls in
+    float rest = (ph > 0.40f) ? -0.30f * smoothstep(0.40f, 0.60f, ph) * (1.0f - smoothstep(0.85f, 1.0f, ph)) : 0.0f;
+    return pulse + rest;
+}
+
 // A particle lives in 3D on/near a unit sphere shell. It drifts by a small
 // angular velocity in spherical space so it never leaves the shell (smooth,
 // no popping, no re-seeding jitter).
@@ -110,7 +127,7 @@ int main(int argc, char **argv) {
 
     srand(42);
     float ox = W * 0.5f, oy = H * 0.5f;
-    float scale = fminf(W, H) * 0.28f;
+    float scale = fminf(W, H) * 0.25f;
 
     // Seed particles uniformly on the shell (Fibonacci-ish) with slow drift.
     for (int i = 0; i < NPART; i++) {
@@ -172,9 +189,13 @@ int main(int argc, char **argv) {
         static float scale_dyn = 1.0f;
         float base_target = 1.0f + 0.35f * act;
         scale_dyn += (base_target - scale_dyn) * (1.0f - expf(-2.5f * dt));
-        // heartbeat oscillation: ~0.28 Hz (a calm resting pulse), up to +/-12% at full act.
-        float beat = sinf(global_time * 1.8f);
-        float breathe = 1.0f + (0.02f + 0.12f * act) * beat;
+        // Cardiac lub-dub. Beat rate rises with activity (~0.5 Hz calm -> ~1.3 Hz busy);
+        // amplitude tiny at idle, deep when working (up to +/-20%).
+        static float beat_phase = 0.0f;
+        float beat_hz = 0.5f + 0.8f * act;
+        beat_phase += beat_hz * dt;
+        float amp = 0.015f + 0.20f * act;
+        float breathe = 1.0f + amp * heartbeat(beat_phase);
         float escale = scale * scale_dyn * breathe;
 
         // --- draw ---
