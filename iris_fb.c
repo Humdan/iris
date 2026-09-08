@@ -128,9 +128,9 @@ int main(int argc, char **argv) {
 
     srand(42);
     // Orb offset into the free area: left column for stats, top strip for the
-    // clock, bottom strip for the agent panel. Lifted + shrunk to clear both.
-    float ox = 505.0f, oy = 250.0f;
-    float scale = 95.0f;
+    // clock, bottom strip for the agent panel. Sized as large as fits.
+    float ox = 545.0f, oy = 242.0f;
+    float scale = 110.0f;
 
     // Seed particles uniformly on the shell (Fibonacci-ish) with slow drift.
     for (int i = 0; i < NPART; i++) {
