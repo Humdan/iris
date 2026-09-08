@@ -16,6 +16,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <time.h>
+#include "iris_widgets.h"
 
 #define NPART 700          // particles on the shell
 #define NSPARK 64          // travelling sparks (activity)
@@ -126,8 +127,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "iris_fb (particles): %dx%d %dbpp stride %d\n", W, H, BPP, STRIDE);
 
     srand(42);
-    float ox = W * 0.5f, oy = H * 0.5f;
-    float scale = fminf(W, H) * 0.25f;
+    // Orb is offset into the free area: left column reserved for stats,
+    // top strip for the clock. Center ~(505,280), shrunk so max pulse fits.
+    float ox = 505.0f, oy = 280.0f;
+    float scale = 105.0f;
 
     // Seed particles uniformly on the shell (Fibonacci-ish) with slow drift.
     for (int i = 0; i < NPART; i++) {
@@ -144,9 +147,10 @@ int main(int argc, char **argv) {
     for (int i = 0; i < NSPARK; i++) sparks[i].life = 0;
 
     float act = 0, target = 0;
-    double t0 = now(), tlast = t0, tcheck = 0, tfps = t0, tnext = t0;
+    double t0 = now(), tlast = t0, tcheck = 0, tfps = t0, tnext = t0, tstats = 0;
     int frames = 0;
     float global_time = 0, spark_time = 0;
+    Stats stats; read_stats(&stats);   // widget stats, refreshed ~1 Hz below
 
     while (running) {
         double t = now();
@@ -257,6 +261,10 @@ int main(int argc, char **argv) {
             dot_16(back, W, H, STRIDE, px, py, 2.0f + 2.0f * fade,
                    0.5f * fade, 0.8f * fade, 1.0f * fade);
         }
+
+        // --- widgets: clock + system stats drawn on top of the orb frame ---
+        if (t - tstats > 1.0) { tstats = t; read_stats(&stats); }
+        draw_widgets(back, W, H, STRIDE, &stats);
 
         // --- blit atomically ---
         memcpy(fb_raw, back_raw, fbsize);
