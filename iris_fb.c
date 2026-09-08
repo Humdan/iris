@@ -242,8 +242,10 @@ int main(int argc, char **argv) {
     if (!have_touch_thread) fprintf(stderr, "touch: pthread_create failed (gestures disabled)\n");
 
     // gesture / interaction state (owned by the render loop)
-    float touch_offset = 0.0f;   // extra Y-axis angle added to auto rotation
-    float touch_vel    = 0.0f;   // angular velocity injected by horizontal drag (rad/s)
+    float touch_offset = 0.0f;   // extra Y-axis (yaw) angle added to auto rotation
+    float touch_vel    = 0.0f;   // yaw angular velocity injected by horizontal drag (rad/s)
+    float pitch_offset = 0.0f;   // extra X-axis (pitch) angle from vertical drag
+    float pitch_vel    = 0.0f;   // pitch angular velocity (rad/s)
     float scroll_f     = 0.0f;   // eased scroll position (fractional job index)
     int   scroll_target = 0;     // integer scroll goal, adjusted by vertical swipe
     int   sel_job      = -1;     // selected job for detail overlay, -1 = none
@@ -282,26 +284,31 @@ int main(int argc, char **argv) {
         }
 
         // While the finger is down, classify and act on movement.
+        // Region gate: a drag that STARTS on the left queue panel is a vertical
+        // scroll gesture; a drag anywhere else rotates the sphere freely in BOTH
+        // axes at once (horizontal -> yaw, vertical -> pitch, diagonal -> both).
         if (td) {
             double dts = t - prev_sample_t; if (dts <= 0) dts = 1.0/60.0;
-            int dx = tx - prev_x;
+            int dx = tx - prev_x, dy = ty - prev_y;
             int total_dx = tx - gesture_down_x, total_dy = ty - gesture_down_y;
+            int started_in_panel = (gesture_down_x < QUEUE_PANEL_W);
 
-            // decide gesture axis once movement exceeds a small threshold
+            // decide gesture kind once movement exceeds a small threshold
             if (!gesture_decided && (abs(total_dx) > 8 || abs(total_dy) > 8)) {
                 gesture_decided = 1;
-                int in_panel = (gesture_down_x < QUEUE_PANEL_W);
-                if (in_panel && abs(total_dy) >= abs(total_dx))
+                if (started_in_panel && abs(total_dy) >= abs(total_dx))
                     gesture_is_vertical = 1;     // swipe-scroll the queue
                 else
-                    gesture_is_horizontal = 1;   // drag-to-spin (anywhere else, or horizontal in panel)
+                    gesture_is_horizontal = 1;   // free rotate the sphere (yaw + pitch)
             }
 
             if (gesture_is_horizontal) {
-                // horizontal drag injects angular velocity (rad/s). 800px ~ full 2pi.
+                // free-drag rotation: horizontal -> yaw, vertical -> pitch. 900px ~ 2pi.
                 float ang_per_px = 6.2831853f / 900.0f;
-                touch_vel = (float)dx * ang_per_px / (float)dts;
-                touch_offset += (float)dx * ang_per_px;    // immediate follow, no snap
+                touch_vel   = (float)dx * ang_per_px / (float)dts;   // yaw velocity
+                touch_offset += (float)dx * ang_per_px;              // immediate yaw follow
+                pitch_vel   = (float)dy * ang_per_px / (float)dts;   // pitch velocity
+                pitch_offset += (float)dy * ang_per_px;              // immediate pitch follow
             } else if (gesture_is_vertical) {
                 // swipe up -> scroll down the list; QUEUE_ROW_H px per job
                 int rows = -total_dy / QUEUE_ROW_H;   // finger up (dy<0) advances list
@@ -345,12 +352,15 @@ int main(int argc, char **argv) {
         }
 
         // Touch-driven rotation: when no finger drives it, momentum coasts and
-        // the accumulated offset DECAYS smoothly back to 0 so auto-rotation
+        // the accumulated offsets DECAY smoothly back to 0 so auto-rotation
         // resumes with no snap. Everything eased — no velocity discontinuity.
         if (!(td && gesture_is_horizontal)) {
-            touch_offset += touch_vel * dt;               // coast on released momentum
-            touch_vel   -= touch_vel * (1.0f - expf(-2.5f * dt));   // friction on velocity
-            touch_offset -= touch_offset * (1.0f - expf(-0.6f * dt)); // ease offset home
+            touch_offset += touch_vel * dt;               // coast on released yaw momentum
+            touch_vel   -= touch_vel * (1.0f - expf(-2.5f * dt));   // friction on yaw velocity
+            touch_offset -= touch_offset * (1.0f - expf(-0.6f * dt)); // ease yaw offset home
+            pitch_offset += pitch_vel * dt;               // coast on released pitch momentum
+            pitch_vel   -= pitch_vel * (1.0f - expf(-2.5f * dt));    // friction on pitch velocity
+            pitch_offset -= pitch_offset * (1.0f - expf(-0.6f * dt)); // ease pitch offset home
         }
         prev_down = td; (void)prev_down;
         // ---------------------------------------------------------------
@@ -377,8 +387,9 @@ int main(int argc, char **argv) {
         float phase = fmodf(global_time, period) / period;
         float tri = phase < 0.5f ? phase * 2.0f : (1.0f - phase) * 2.0f;
         float eased = tri * tri * tri * (tri * (tri * 6.0f - 15.0f) + 10.0f);
-        float rot = eased * 6.2831853f + touch_offset;   // auto + touch-driven offset
-        float cr = cosf(rot), sr = sinf(rot);
+        float rot = eased * 6.2831853f + touch_offset;   // yaw = auto + touch-driven offset
+        float cr = cosf(rot), sr = sinf(rot);             // yaw (Y-axis)
+        float cp = cosf(pitch_offset), sp = sinf(pitch_offset);  // pitch (X-axis), touch-only
 
         // drift speed scales gently with activity
         float drift = 0.5f + 1.3f * act;
@@ -416,13 +427,16 @@ int main(int argc, char **argv) {
             float sx = sinf(p->phi) * cosf(p->theta) * p->r;
             float sy = cosf(p->phi) * p->r;
             float sz = sinf(p->phi) * sinf(p->theta) * p->r;
-            // rotate about Y
+            // rotate about Y (yaw)
             float xr = sx * cr + sz * sr;
             float zr = -sx * sr + sz * cr;
+            // then rotate about X (pitch): tips (sy, zr)
+            float yr2 = sy * cp - zr * sp;
+            float zr2 = sy * sp + zr * cp;
 
-            float depth = 0.80f + 0.20f * zr;   // 0.6..1.0, front = brighter/bigger
+            float depth = 0.80f + 0.20f * zr2;   // 0.6..1.0, front = brighter/bigger
             float px = ox + xr * escale * depth;
-            float py = oy + sy * escale * depth;
+            float py = oy + yr2 * escale * depth;
 
             // brightness: brighter baseline, gentle twinkle, lifts with activity, dims with depth
             float tw = 0.75f + 0.25f * sinf(p->twinkle);
@@ -451,9 +465,11 @@ int main(int argc, char **argv) {
             s->life -= dt * 0.9f;
             float xr = s->x * cr + s->z * sr;
             float zr = -s->x * sr + s->z * cr;
-            float depth = 0.80f + 0.20f * zr;
+            float yr2 = s->y * cp - zr * sp;
+            float zr2 = s->y * sp + zr * cp;
+            float depth = 0.80f + 0.20f * zr2;
             float px = ox + xr * escale * depth;
-            float py = oy + s->y * escale * depth;
+            float py = oy + yr2 * escale * depth;
             float fade = smoothstep(0, 0.2f, s->life);
             dot_16(back, W, H, STRIDE, px, py, 2.0f + 2.0f * fade,
                    0.5f * fade, 0.8f * fade, 1.0f * fade);
