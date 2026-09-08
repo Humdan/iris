@@ -28,20 +28,20 @@ static float frand(void) { return rand() / (float)RAND_MAX; }
 static float smoothstep(float e0, float e1, float x) { float t = clampf((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); }
 
 // Cardiac lub-dub envelope over a normalized phase [0,1): a strong first beat
-// (lub), a quick smaller second beat (dub), then a resting baseline. Returns
-// roughly [-0.35, 1.0]; multiply by amplitude. Two raised-cosine bumps + a
-// gentle diastolic dip so it reads as a real heartbeat, not a sine.
+// (lub) and a quick smaller second beat (dub) on a continuous baseline.
+// Built from two Gaussians (infinitely smooth, taper naturally to rest) so
+// expansion and contraction flow with no velocity snap. Roughly [-0.2, 1.0].
 static float heartbeat(float ph) {
     ph -= floorf(ph);
-    float lub = 0.0f, dub = 0.0f;
-    // lub: bump centered ~0.10, width ~0.09
-    if (ph > 0.01f && ph < 0.19f) { float u = (ph - 0.01f) / 0.18f; lub = 0.5f - 0.5f * cosf(u * 6.2831853f); }
-    // dub: smaller bump centered ~0.30, width ~0.07
-    if (ph > 0.24f && ph < 0.38f) { float u = (ph - 0.24f) / 0.14f; dub = 0.45f * (0.5f - 0.5f * cosf(u * 6.2831853f)); }
-    float pulse = lub + dub;
-    // slight contraction (dip) during the long rest so it visibly pulls in
-    float rest = (ph > 0.40f) ? -0.30f * smoothstep(0.40f, 0.60f, ph) * (1.0f - smoothstep(0.85f, 1.0f, ph)) : 0.0f;
-    return pulse + rest;
+    // wrap-aware distance so the curve is continuous across the 1.0->0.0 seam
+    float d_lub = ph - 0.14f; if (d_lub > 0.5f) d_lub -= 1.0f; if (d_lub < -0.5f) d_lub += 1.0f;
+    float d_dub = ph - 0.30f; if (d_dub > 0.5f) d_dub -= 1.0f; if (d_dub < -0.5f) d_dub += 1.0f;
+    float lub = expf(-(d_lub * d_lub) / (2.0f * 0.075f * 0.075f));         // strong, wide
+    float dub = 0.55f * expf(-(d_dub * d_dub) / (2.0f * 0.060f * 0.060f)); // smaller, tighter
+    // gentle diastolic dip centered in the long rest (also a Gaussian -> smooth)
+    float d_rest = ph - 0.68f; if (d_rest > 0.5f) d_rest -= 1.0f; if (d_rest < -0.5f) d_rest += 1.0f;
+    float dip = -0.18f * expf(-(d_rest * d_rest) / (2.0f * 0.14f * 0.14f));
+    return lub + dub + dip;
 }
 
 // A particle lives in 3D on/near a unit sphere shell. It drifts by a small
@@ -192,7 +192,7 @@ int main(int argc, char **argv) {
         // Cardiac lub-dub. Beat rate rises with activity (~0.5 Hz calm -> ~1.3 Hz busy);
         // amplitude tiny at idle, deep when working (up to +/-20%).
         static float beat_phase = 0.0f;
-        float beat_hz = 0.5f + 0.8f * act;
+        float beat_hz = 0.5f + 0.5f * act;
         beat_phase += beat_hz * dt;
         float amp = 0.015f + 0.20f * act;
         float breathe = 1.0f + amp * heartbeat(beat_phase);
