@@ -127,10 +127,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "iris_fb (particles): %dx%d %dbpp stride %d\n", W, H, BPP, STRIDE);
 
     srand(42);
-    // Orb is offset into the free area: left column reserved for stats,
-    // top strip for the clock. Center ~(505,280), shrunk so max pulse fits.
-    float ox = 505.0f, oy = 280.0f;
-    float scale = 105.0f;
+    // Orb offset into the free area: left column for stats, top strip for the
+    // clock, bottom strip for the agent panel. Lifted + shrunk to clear both.
+    float ox = 505.0f, oy = 250.0f;
+    float scale = 95.0f;
 
     // Seed particles uniformly on the shell (Fibonacci-ish) with slow drift.
     for (int i = 0; i < NPART; i++) {
@@ -151,6 +151,7 @@ int main(int argc, char **argv) {
     int frames = 0;
     float global_time = 0, spark_time = 0;
     Stats stats; read_stats(&stats);   // widget stats, refreshed ~1 Hz below
+    AgentStats agent; read_agent_stats(&agent);
 
     while (running) {
         double t = now();
@@ -262,9 +263,10 @@ int main(int argc, char **argv) {
                    0.5f * fade, 0.8f * fade, 1.0f * fade);
         }
 
-        // --- widgets: clock + system stats drawn on top of the orb frame ---
-        if (t - tstats > 1.0) { tstats = t; read_stats(&stats); }
+        // --- widgets: clock + system stats + agent panel on top of the orb ---
+        if (t - tstats > 1.0) { tstats = t; read_stats(&stats); read_agent_stats(&agent); }
         draw_widgets(back, W, H, STRIDE, &stats);
+        draw_agent_panel(back, W, H, STRIDE, &agent);
 
         // --- blit atomically ---
         memcpy(fb_raw, back_raw, fbsize);

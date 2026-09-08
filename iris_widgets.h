@@ -200,4 +200,121 @@ static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const Stats *
   wtext(back, W, H, STRIDE, lx, ly + 2*lh + 30, buf, 1, dim_r, dim_g, dim_b);
 }
 
+// ---- agent / Hermes stats ----
+typedef struct {
+  float activity;        // 0..1 from /tmp/iris_state
+  int thinking;          // activity high / state == thinking
+  int gateway_up;        // gateway_state == running
+  int telegram_ok;       // telegram platform connected
+  int active_agents;     // subagents currently working
+  int last_active_s;     // seconds since gateway updated_at
+  char version[16];      // hermes code_version
+} AgentStats;
+
+// Extract a "key":value from a small JSON blob without a parser.
+// Returns pointer just after the ':' for `key`, or NULL.
+static const char *json_find(const char *buf, const char *key) {
+  char pat[64];
+  snprintf(pat, sizeof(pat), "\"%s\"", key);
+  const char *p = strstr(buf, pat);
+  if (!p) return NULL;
+  p = strchr(p + strlen(pat), ':');
+  return p ? p + 1 : NULL;
+}
+
+// Parse an ISO8601 UTC timestamp ("2026-09-08T01:14:41...") to epoch seconds.
+static time_t parse_iso_utc(const char *s) {
+  struct tm tm; memset(&tm, 0, sizeof(tm));
+  if (sscanf(s, "%d-%d-%dT%d:%d:%d",
+             &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
+             &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 6) return 0;
+  tm.tm_year -= 1900; tm.tm_mon -= 1;
+  return timegm(&tm);
+}
+
+static void read_agent_stats(AgentStats *a) {
+  memset(a, 0, sizeof(*a));
+  strcpy(a->version, "?");
+
+  // activity level from iris state file
+  FILE *f = fopen("/tmp/iris_state", "r");
+  if (f) {
+    char buf[32] = {0};
+    if (fgets(buf, sizeof(buf) - 1, f)) {
+      if (strncmp(buf, "thinking", 8) == 0) { a->activity = 1.0f; a->thinking = 1; }
+      else if (strncmp(buf, "idle", 4) == 0) { a->activity = 0.0f; }
+      else { a->activity = strtof(buf, NULL); a->thinking = a->activity > 0.5f; }
+    }
+    fclose(f);
+  }
+
+  // gateway_state.json — read whole small file
+  f = fopen("/home/humdan/.hermes/gateway_state.json", "r");
+  if (f) {
+    char buf[4096]; size_t n = fread(buf, 1, sizeof(buf) - 1, f); buf[n] = 0;
+    fclose(f);
+    const char *p;
+    if ((p = json_find(buf, "gateway_state"))) a->gateway_up = (strstr(p, "running") && strstr(p, "running") < p + 20);
+    // telegram connected?
+    const char *tg = strstr(buf, "\"telegram\"");
+    if (tg && (p = json_find(tg, "state"))) a->telegram_ok = (strstr(p, "connected") && strstr(p, "connected") < p + 20);
+    if ((p = json_find(buf, "active_agents"))) a->active_agents = atoi(p);
+    if ((p = json_find(buf, "code_version"))) {
+      const char *q = strchr(p, '"');
+      if (q) { q++; int i = 0; while (*q && *q != '"' && i < 15) a->version[i++] = *q++; a->version[i] = 0; }
+    }
+    if ((p = json_find(buf, "updated_at"))) {
+      const char *q = strchr(p, '"');
+      if (q) { time_t up = parse_iso_utc(q + 1); if (up) { time_t d = time(NULL) - up; a->last_active_s = d < 0 ? 0 : (int)d; } }
+    }
+  }
+}
+
+// Bottom full-width agent panel.
+static void draw_agent_panel(uint16_t *back, int W, int H, int STRIDE, const AgentStats *a) {
+  const float cyan_r = 0.35f, cyan_g = 0.75f, cyan_b = 0.95f;
+  const float dim_r = 0.40f, dim_g = 0.45f, dim_b = 0.52f;
+  const float ok_r = 0.25f, ok_g = 0.85f, ok_b = 0.45f;
+  const float bad_r = 0.95f, bad_g = 0.30f, bad_b = 0.30f;
+  char buf[48];
+  int y = H - 58;   // strip top
+
+  // separator line
+  for (int x = 12; x < W - 12; x++) wput(back, W, H, STRIDE, x, y - 8, 0.14f, 0.16f, 0.20f);
+
+  // HERMES label + version
+  int x = 12;
+  x = wtext(back, W, H, STRIDE, x, y, "HERMES", 2, dim_r, dim_g, dim_b);
+  snprintf(buf, sizeof(buf), "V%s", a->version);
+  wtext(back, W, H, STRIDE, x + 6, y + 2, buf, 1, dim_r, dim_g, dim_b);
+
+  // STATE: THINKING / IDLE + activity bar
+  const char *stxt = a->thinking ? "THINKING" : "IDLE";
+  float sr = a->thinking ? cyan_r : dim_r, sg = a->thinking ? cyan_g : dim_g, sb = a->thinking ? cyan_b : dim_b;
+  wtext(back, W, H, STRIDE, 12, y + 24, stxt, 2, sr, sg, sb);
+  wbar(back, W, H, STRIDE, 120, y + 26, 120, 8, a->activity * 100.0f);
+
+  // GATEWAY dot
+  int gx = 300;
+  float gr = a->gateway_up ? ok_r : bad_r, gg = a->gateway_up ? ok_g : bad_g, gb = a->gateway_up ? ok_b : bad_b;
+  for (int yy = 0; yy < 10; yy++) for (int xx = 0; xx < 10; xx++)
+    if ((xx-5)*(xx-5)+(yy-5)*(yy-5) <= 25) wput(back, W, H, STRIDE, gx+xx, y+2+yy, gr, gg, gb);
+  wtext(back, W, H, STRIDE, gx + 16, y, "GATEWAY", 2, dim_r, dim_g, dim_b);
+  wtext(back, W, H, STRIDE, gx + 16, y + 22, a->telegram_ok ? "TELEGRAM OK" : "TG DOWN", 1,
+        a->telegram_ok ? ok_r : bad_r, a->telegram_ok ? ok_g : bad_g, a->telegram_ok ? ok_b : bad_b);
+
+  // AGENTS working
+  int ax = 500;
+  snprintf(buf, sizeof(buf), "AGENTS %d", a->active_agents);
+  wtext(back, W, H, STRIDE, ax, y, buf, 2,
+        a->active_agents > 0 ? cyan_r : dim_r, a->active_agents > 0 ? cyan_g : dim_g, a->active_agents > 0 ? cyan_b : dim_b);
+
+  // LAST ACTIVE
+  int ls = a->last_active_s;
+  if (ls < 60) snprintf(buf, sizeof(buf), "SEEN %dS", ls);
+  else if (ls < 3600) snprintf(buf, sizeof(buf), "SEEN %dM", ls / 60);
+  else snprintf(buf, sizeof(buf), "SEEN %dH", ls / 3600);
+  wtext(back, W, H, STRIDE, ax, y + 24, buf, 1, dim_r, dim_g, dim_b);
+}
+
 #endif
