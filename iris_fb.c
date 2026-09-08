@@ -150,7 +150,7 @@ int main(int argc, char **argv) {
     double t0 = now(), tlast = t0, tcheck = 0, tfps = t0, tnext = t0, tstats = 0;
     int frames = 0;
     float global_time = 0, spark_time = 0;
-    Stats stats; read_stats(&stats);   // widget stats, refreshed ~1 Hz below
+    FeedStats stats; read_stats(&stats);   // clock + tool-call feed, refreshed ~1 Hz below
     AgentStats agent; read_agent_stats(&agent);
 
     while (running) {

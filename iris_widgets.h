@@ -25,6 +25,7 @@ static const Glyph FONT[] = {
   {'/',{0x20,0x10,0x08,0x04,0x02}},
   {':',{0x00,0x36,0x36,0x00,0x00}},
   {'-',{0x08,0x08,0x08,0x08,0x08}},
+  {'_',{0x40,0x40,0x40,0x40,0x40}},
   {'C',{0x3E,0x41,0x41,0x41,0x22}},
   {'0',{0x3E,0x51,0x49,0x45,0x3E}},
   {'1',{0x00,0x42,0x7F,0x40,0x00}},
@@ -50,6 +51,7 @@ static const Glyph FONT[] = {
   {'N',{0x7F,0x04,0x08,0x10,0x7F}},
   {'O',{0x3E,0x41,0x41,0x41,0x3E}},
   {'P',{0x7F,0x09,0x09,0x09,0x06}},
+  {'Q',{0x3E,0x41,0x51,0x21,0x5E}},
   {'R',{0x7F,0x09,0x19,0x29,0x46}},
   {'S',{0x46,0x49,0x49,0x49,0x31}},
   {'T',{0x01,0x01,0x7F,0x01,0x01}},
@@ -117,87 +119,130 @@ static void wbar(uint16_t *back, int W, int H, int STRIDE, int x, int y,
       wput(back, W, H, STRIDE, x+xx, y+yy, fr, fg, fb);
 }
 
-// ---- stats ----
+// ---- cron job queue (replaces tool-call feed) ----
+#define CRON_MAX 6
 typedef struct {
-  float cpu_pct, temp_c, mem_pct;
-  int mem_used_mb, mem_total_mb;
-  char clock[16];   // HH:MM:SS
-  char date[24];    // e.g. MON SEP 07
-} Stats;
+  char clock[16];
+  char date[24];
+  char names[CRON_MAX][22];   // job name (truncated)
+  char when[CRON_MAX][18];    // next-run "in 3h" / "7AM" style
+  int  status[CRON_MAX];      // 0 ok/scheduled, 1 error, 2 paused/disabled
+  int  njobs;
+} FeedStats;
 
-static void read_stats(Stats *st) {
-  // clock/date
+// Grab the string value of "key":"...": into out (bounded). Returns 1 on hit.
+static int json_str(const char *start, const char *end, const char *key,
+                    char *out, int outsz) {
+  char pat[48]; snprintf(pat, sizeof(pat), "\"%s\"", key);
+  const char *p = strstr(start, pat);
+  if (!p || p >= end) { out[0] = 0; return 0; }
+  p = strchr(p + strlen(pat), ':'); if (!p) { out[0]=0; return 0; }
+  p++; while (*p == ' ') p++;
+  if (*p != '"') { out[0]=0; return 0; }   // null / non-string
+  p++;
+  int i = 0;
+  while (*p && *p != '"' && i < outsz - 1) out[i++] = *p++;
+  out[i] = 0;
+  return 1;
+}
+
+// Turn an ISO8601-with-offset next_run into a compact "in 2H" / "in 15M" label.
+static void when_label(const char *iso, char *out, int outsz) {
+  if (!iso[0]) { snprintf(out, outsz, "-"); return; }
+  struct tm tm; memset(&tm, 0, sizeof(tm));
+  int off_h = 0, off_m = 0; char sign = '+';
+  int n = sscanf(iso, "%d-%d-%dT%d:%d:%d%c%d:%d",
+                 &tm.tm_year,&tm.tm_mon,&tm.tm_mday,&tm.tm_hour,&tm.tm_min,&tm.tm_sec,
+                 &sign,&off_h,&off_m);
+  if (n < 6) { snprintf(out, outsz, "-"); return; }
+  tm.tm_year -= 1900; tm.tm_mon -= 1;
+  time_t local = timegm(&tm);   // treat parsed wall-time as UTC...
+  if (n >= 8) { long off = (off_h*3600 + off_m*60) * (sign=='-'?1:-1); local += off; } // ...then correct by offset -> real UTC
+  long d = (long)(local - time(NULL));
+  if (d < 0) { snprintf(out, outsz, "DUE"); return; }
+  if (d < 3600) snprintf(out, outsz, "IN %ldM", d/60);
+  else if (d < 86400) snprintf(out, outsz, "IN %ldH", d/3600);
+  else snprintf(out, outsz, "IN %ldD", d/86400);
+}
+
+static void read_stats(FeedStats *st) {
   time_t now = time(NULL);
   struct tm *tm = localtime(&now);
   strftime(st->clock, sizeof(st->clock), "%H:%M:%S", tm);
   strftime(st->date, sizeof(st->date), "%a %b %d", tm);
-  for (char *p = st->date; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32; // uppercase
+  for (char *p = st->date; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32;
 
-  // CPU % from /proc/loadavg / ncpu
-  st->cpu_pct = 0;
-  FILE *f = fopen("/proc/loadavg", "r");
-  if (f) { float la; if (fscanf(f, "%f", &la) == 1) {
-      long nc = sysconf(_SC_NPROCESSORS_ONLN); if (nc < 1) nc = 1;
-      st->cpu_pct = 100.0f * la / nc; if (st->cpu_pct > 100) st->cpu_pct = 100;
-    } fclose(f); }
+  st->njobs = 0;
+  FILE *f = fopen("/home/humdan/.hermes/cron/jobs.json", "r");
+  if (!f) return;
+  static char buf[16384];
+  size_t nlen = fread(buf, 1, sizeof(buf) - 1, f); buf[nlen] = 0; fclose(f);
 
-  // memory from /proc/meminfo
-  st->mem_pct = 0; st->mem_used_mb = st->mem_total_mb = 0;
-  f = fopen("/proc/meminfo", "r");
-  if (f) {
-    long total = 0, avail = 0; char key[64]; long val;
-    while (fscanf(f, "%63[^:]: %ld kB\n", key, &val) == 2) {
-      if (strcmp(key, "MemTotal") == 0) total = val;
-      else if (strcmp(key, "MemAvailable") == 0) avail = val;
-    }
-    fclose(f);
-    if (total > 0) {
-      long used = total - avail;
-      st->mem_total_mb = (int)(total / 1024);
-      st->mem_used_mb = (int)(used / 1024);
-      st->mem_pct = 100.0f * used / total;
-    }
+  // iterate job objects by locating each "id" then bounding to the next "id".
+  const char *p = buf;
+  while (st->njobs < CRON_MAX) {
+    const char *idp = strstr(p, "\"id\"");
+    if (!idp) break;
+    const char *nextid = strstr(idp + 4, "\"id\"");
+    const char *end = nextid ? nextid : buf + nlen;
+
+    char name[22], when_iso[40], status[16], enabled[8], state[20];
+    json_str(idp, end, "name", name, sizeof(name));
+    json_str(idp, end, "next_run_at", when_iso, sizeof(when_iso));
+    json_str(idp, end, "last_status", status, sizeof(status));
+    json_str(idp, end, "state", state, sizeof(state));
+    // enabled is a bareword true/false — scan manually
+    int is_enabled = 1;
+    const char *ep = strstr(idp, "\"enabled\"");
+    if (ep && ep < end) { const char *c = strchr(ep, ':'); if (c && strstr(c, "false") && strstr(c, "false") < c + 8) is_enabled = 0; }
+
+    strncpy(st->names[st->njobs], name, 21); st->names[st->njobs][21] = 0;
+    when_label(when_iso, st->when[st->njobs], sizeof(st->when[st->njobs]));
+    int s = 0;
+    if (!is_enabled || (state[0] && strncmp(state, "paused", 6) == 0)) s = 2;
+    else if (strncmp(status, "error", 5) == 0) s = 1;
+    st->status[st->njobs] = s;
+
+    st->njobs++;
+    p = end;
   }
-
-  // temp from thermal zone (no vcgencmd dependency in-loop)
-  st->temp_c = 0;
-  f = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
-  if (f) { long milli; if (fscanf(f, "%ld", &milli) == 1) st->temp_c = milli / 1000.0f; fclose(f); }
 }
 
-// Render the widget frame (clock top, stats left) into the back buffer.
-static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const Stats *st) {
+// Render clock (top) + cron job queue (left column).
+static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const FeedStats *st) {
   const float cyan_r = 0.35f, cyan_g = 0.75f, cyan_b = 0.95f;
   const float dim_r = 0.40f, dim_g = 0.45f, dim_b = 0.52f;
-  char buf[48];
+  const float ok_r = 0.25f, ok_g = 0.85f, ok_b = 0.45f;
+  const float err_r = 0.95f, err_g = 0.30f, err_b = 0.30f;
 
-  // --- top: big clock, centered over the whole width; date under it ---
-  int tw = (int)strlen(st->clock) * 6 * 4;      // scale 4
+  // --- top: big clock centered; date under it ---
+  int tw = (int)strlen(st->clock) * 6 * 4;
   wtext(back, W, H, STRIDE, (W - tw) / 2, 10, st->clock, 4, cyan_r, cyan_g, cyan_b);
-  int dw = (int)strlen(st->date) * 6 * 2;        // scale 2
+  int dw = (int)strlen(st->date) * 6 * 2;
   wtext(back, W, H, STRIDE, (W - dw) / 2, 44, st->date, 2, dim_r, dim_g, dim_b);
 
-  // --- left column: SYSTEM stats ---
-  int lx = 12, ly = 150, lh = 66;               // block start + line spacing
-  wtext(back, W, H, STRIDE, lx, ly - 30, "SYSTEM", 2, dim_r, dim_g, dim_b);
+  // --- left column: cron QUEUE ---
+  int lx = 12, ly = 116;
+  char hdr[24]; snprintf(hdr, sizeof(hdr), "QUEUE %d", st->njobs);
+  wtext(back, W, H, STRIDE, lx, ly - 28, hdr, 2, dim_r, dim_g, dim_b);
 
-  // CPU
-  snprintf(buf, sizeof(buf), "CPU  %d%%", (int)(st->cpu_pct + 0.5f));
-  wtext(back, W, H, STRIDE, lx, ly, buf, 2, cyan_r, cyan_g, cyan_b);
-  wbar(back, W, H, STRIDE, lx, ly + 18, 180, 8, st->cpu_pct);
-
-  // TEMP
-  snprintf(buf, sizeof(buf), "TEMP %dC", (int)(st->temp_c + 0.5f));
-  wtext(back, W, H, STRIDE, lx, ly + lh, buf, 2, cyan_r, cyan_g, cyan_b);
-  // temp bar scaled 0..90C
-  wbar(back, W, H, STRIDE, lx, ly + lh + 18, 180, 8, st->temp_c / 90.0f * 100.0f);
-
-  // RAM
-  snprintf(buf, sizeof(buf), "RAM  %d%%", (int)(st->mem_pct + 0.5f));
-  wtext(back, W, H, STRIDE, lx, ly + 2*lh, buf, 2, cyan_r, cyan_g, cyan_b);
-  wbar(back, W, H, STRIDE, lx, ly + 2*lh + 18, 180, 8, st->mem_pct);
-  snprintf(buf, sizeof(buf), "%d/%d MB", st->mem_used_mb, st->mem_total_mb);
-  wtext(back, W, H, STRIDE, lx, ly + 2*lh + 30, buf, 1, dim_r, dim_g, dim_b);
+  if (st->njobs == 0) {
+    wtext(back, W, H, STRIDE, lx, ly, "NO JOBS", 2, dim_r, dim_g, dim_b);
+    return;
+  }
+  for (int i = 0; i < st->njobs; i++) {
+    int yy = ly + i * 44;
+    // status dot: green ok, red error, amber paused
+    float dr, dg, db;
+    if (st->status[i] == 1) { dr=err_r; dg=err_g; db=err_b; }
+    else if (st->status[i] == 2) { dr=0.95f; dg=0.75f; db=0.20f; }
+    else { dr=ok_r; dg=ok_g; db=ok_b; }
+    for (int a = 0; a < 8; a++) for (int b = 0; b < 8; b++)
+      if ((a-4)*(a-4)+(b-4)*(b-4) <= 16) wput(back, W, H, STRIDE, lx+a, yy+2+b, dr, dg, db);
+    // name (bright) + next-run (dim) under it
+    wtext(back, W, H, STRIDE, lx + 14, yy, st->names[i], 2, cyan_r, cyan_g, cyan_b);
+    wtext(back, W, H, STRIDE, lx + 14, yy + 18, st->when[i], 1, dim_r, dim_g, dim_b);
+  }
 }
 
 // ---- agent / Hermes stats ----
