@@ -127,10 +127,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "iris_fb (particles): %dx%d %dbpp stride %d\n", W, H, BPP, STRIDE);
 
     srand(42);
-    // Orb offset into the free area: left column for stats, top strip for the
-    // clock, bottom strip for the agent panel. Sized as large as fits.
-    float ox = 545.0f, oy = 242.0f;
-    float scale = 110.0f;
+    // Orb offset into the free area, pushed right to use open space.
+    float ox = 560.0f, oy = 240.0f;
+    float scale = 137.0f;
 
     // Seed particles uniformly on the shell (Fibonacci-ish) with slow drift.
     for (int i = 0; i < NPART; i++) {
