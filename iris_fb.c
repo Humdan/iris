@@ -273,6 +273,7 @@ int main(int argc, char **argv) {
     NightConsole ns_con; memset(&ns_con, 0, sizeof(ns_con));
     double ns_last_read = 0;     // last transcript read (monotonic)
     double ns_fire_at   = -1e9;  // time RUN NOW was tapped; FIRING shows for ~2.5s
+    int    ns_running   = 0;     // night shift actively running (fresh transcript mtime)
 
     // per-gesture bookkeeping tracked across frames
     int   last_seq_down = 0, last_seq_up = 0;
@@ -516,7 +517,7 @@ int main(int argc, char **argv) {
         }
 
         // --- widgets: clock + system stats + agent panel on top of the orb ---
-        if (t - tstats > 1.0) { tstats = t; read_stats(&stats); read_agent_stats(&agent); }
+        if (t - tstats > 1.0) { tstats = t; read_stats(&stats); read_agent_stats(&agent); ns_running = ns_running_check(); }
         if (sel_job >= stats.njobs) sel_job = -1;   // job vanished from queue
         // Refresh the Night shift transcript ~1Hz (only while its console is open).
         int ns_open = (sel_job >= 0 && strcmp(stats.names[sel_job], NS_JOB_NAME) == 0);
@@ -530,6 +531,13 @@ int main(int argc, char **argv) {
             } else {
                 draw_job_detail(back, W, H, STRIDE, &stats, sel_job);
             }
+        }
+
+        // --- Night shift RUNNING ambient layer (additive; only while running) ---
+        if (ns_running) {
+            float pulse = 0.5f + 0.5f * sinf(global_time * 2.0f * (float)M_PI * 0.5f); // ~0.5Hz
+            ns_tint_red(back, W, H, STRIDE, pulse);
+            draw_night_banner(back, W, H, STRIDE, pulse);
         }
 
         // --- blit atomically ---

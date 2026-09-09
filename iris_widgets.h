@@ -343,6 +343,19 @@ static int ns_newest_file(char *out, int outsz) {
   return 1;
 }
 
+// Lightweight running-state probe: stat() ONLY the newest *.md in the output dir
+// (no file open/read) and report whether its mtime is within the last ~25s. The
+// agent appends to that transcript as it works, so a fresh mtime == actively
+// running. Meant to be called ~1Hz off the render cadence, never per frame.
+#define NS_RUNNING_FRESH_S 25
+static int ns_running_check(void) {
+  char path[512];
+  if (!ns_newest_file(path, sizeof(path))) return 0;
+  struct stat sb;
+  if (stat(path, &sb) != 0) return 0;
+  return (time(NULL) - sb.st_mtime) < NS_RUNNING_FRESH_S;
+}
+
 // Cheap, bounded, non-blocking-ish read: open newest run file, seek to the last
 // '## Response' section, keep the LAST NS_MAX_LINES non-empty lines (truncated to
 // NS_LINE_LEN). Meant to be called ~1Hz off the render cadence, not per frame.
@@ -480,6 +493,48 @@ static void draw_night_console(uint16_t *back, int W, int H, int STRIDE,
     wtext(back, W, H, STRIDE, NS_BTN_X + (NS_BTN_W - lw) / 2, NS_BTN_Y + 10,
           label, 2, br, bg, bb);
   }
+}
+
+// --- Night shift RUNNING ambient indicator (additive; drawn only while running) ---
+// Red-tint the ENTIRE back buffer in one pass. RGB565 decode -> tint -> re-encode.
+// `pulse` is 0..1 (gentle sine) so the wash breathes; kept subtle so the sphere,
+// widgets and overlays stay readable. Called at most once per frame, only while
+// the night shift is running (skipped entirely when idle => zero cost).
+static void ns_tint_red(uint16_t *back, int W, int H, int STRIDE, float pulse) {
+  // wash strength: base + small pulse. R lifted, G/B slightly damped.
+  const float rk = 0.10f + 0.05f * pulse;   // add to red
+  const float dk = 0.88f - 0.04f * pulse;   // multiply g/b (dim toward red mood)
+  const int spx = STRIDE / 2;
+  for (int y = 0; y < H; y++) {
+    uint16_t *row = back + y * spx;
+    for (int x = 0; x < W; x++) {
+      uint16_t px = row[x];
+      int r5 = (px >> 11) & 0x1F;
+      int g6 = (px >> 5) & 0x3F;
+      int b5 = px & 0x1F;
+      int nr = (int)(r5 + rk * 31.0f);      if (nr > 31) nr = 31;
+      int ng = (int)(g6 * dk);              if (ng > 63) ng = 63;
+      int nb = (int)(b5 * dk);              if (nb > 31) nb = 31;
+      row[x] = (uint16_t)((nr << 11) | (ng << 5) | nb);
+    }
+  }
+}
+
+// Full-width top banner: a stronger red bar with centered white label. Sits at the
+// very top strip; `pulse` (0..1) gently modulates the bar brightness so it reads live.
+#define NS_BANNER_H 32
+static void draw_night_banner(uint16_t *back, int W, int H, int STRIDE, float pulse) {
+  float br = 0.55f + 0.20f * pulse;   // bar red
+  wfill(back, W, H, STRIDE, 0, 0, W, NS_BANNER_H, br, 0.05f, 0.06f);
+  // thin bright underline for definition
+  wfill(back, W, H, STRIDE, 0, NS_BANNER_H - 2, W, 2, 0.95f, 0.35f, 0.35f);
+  const char *label = "NIGHT SHIFT RUNNING";
+  int scale = 3;
+  int tw = (int)strlen(label) * 6 * scale;   // wtext advance = 6px/char * scale
+  int tx = (W - tw) / 2;
+  int ty = (NS_BANNER_H - 7 * scale) / 2;
+  float lw = 0.95f + 0.05f * pulse;
+  wtext(back, W, H, STRIDE, tx, ty, label, scale, lw, lw, lw);
 }
 
 static void draw_job_detail(uint16_t *back, int W, int H, int STRIDE, const FeedStats *st, int sel) {
