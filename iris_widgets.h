@@ -128,6 +128,10 @@ typedef struct {
   char when[CRON_MAX][18];    // next-run "in 3h" / "7AM" style
   int  status[CRON_MAX];      // 0 ok/scheduled, 1 error, 2 paused/disabled
   int  njobs;
+  // extended fields for the tap-to-inspect detail overlay
+  char schedule[CRON_MAX][40];    // human schedule display, e.g. "every day at 7am"
+  char laststat[CRON_MAX][16];    // last_status text: ok / error / (none)
+  char nextiso[CRON_MAX][40];     // raw next_run_at ISO string
 } FeedStats;
 
 // Grab the string value of "key":"...": into out (bounded). Returns 1 on hit.
@@ -186,11 +190,12 @@ static void read_stats(FeedStats *st) {
     const char *nextid = strstr(idp + 4, "\"id\"");
     const char *end = nextid ? nextid : buf + nlen;
 
-    char name[22], when_iso[40], status[16], enabled[8], state[20];
+    char name[22], when_iso[40], status[16], enabled[8], state[20], sched[40];
     json_str(idp, end, "name", name, sizeof(name));
     json_str(idp, end, "next_run_at", when_iso, sizeof(when_iso));
     json_str(idp, end, "last_status", status, sizeof(status));
     json_str(idp, end, "state", state, sizeof(state));
+    json_str(idp, end, "schedule_display", sched, sizeof(sched));
     // enabled is a bareword true/false — scan manually
     int is_enabled = 1;
     const char *ep = strstr(idp, "\"enabled\"");
@@ -198,6 +203,9 @@ static void read_stats(FeedStats *st) {
 
     strncpy(st->names[st->njobs], name, 21); st->names[st->njobs][21] = 0;
     when_label(when_iso, st->when[st->njobs], sizeof(st->when[st->njobs]));
+    strncpy(st->schedule[st->njobs], sched[0] ? sched : "-", 39); st->schedule[st->njobs][39] = 0;
+    strncpy(st->laststat[st->njobs], status[0] ? status : "NONE", 15); st->laststat[st->njobs][15] = 0;
+    strncpy(st->nextiso[st->njobs], when_iso, 39); st->nextiso[st->njobs][39] = 0;
     int s = 0;
     if (!is_enabled || (state[0] && strncmp(state, "paused", 6) == 0)) s = 2;
     else if (strncmp(status, "error", 5) == 0) s = 1;
@@ -208,8 +216,18 @@ static void read_stats(FeedStats *st) {
   }
 }
 
+// --- queue panel layout constants (shared with touch hit-testing in iris_fb.c) ---
+#define QUEUE_LX      12     // left column x
+#define QUEUE_LY      116    // first row baseline y
+#define QUEUE_ROW_H   44     // pixels per job row
+#define QUEUE_PANEL_W 260    // touch-active width of the left column
+#define QUEUE_VISIBLE 6      // max rows drawn at once
+
 // Render clock (top) + cron job queue (left column).
-static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const FeedStats *st) {
+// scroll: number of jobs scrolled off the top (already clamped by caller).
+// sel:    selected job index, or -1 if none (drawn highlighted).
+static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const FeedStats *st,
+                         int scroll, int sel) {
   const float cyan_r = 0.35f, cyan_g = 0.75f, cyan_b = 0.95f;
   const float dim_r = 0.40f, dim_g = 0.45f, dim_b = 0.52f;
   const float ok_r = 0.25f, ok_g = 0.85f, ok_b = 0.45f;
@@ -222,7 +240,7 @@ static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const FeedSta
   wtext(back, W, H, STRIDE, (W - dw) / 2, 44, st->date, 2, dim_r, dim_g, dim_b);
 
   // --- left column: cron QUEUE ---
-  int lx = 12, ly = 116;
+  int lx = QUEUE_LX, ly = QUEUE_LY;
   char hdr[24]; snprintf(hdr, sizeof(hdr), "QUEUE %d", st->njobs);
   wtext(back, W, H, STRIDE, lx, ly - 28, hdr, 2, dim_r, dim_g, dim_b);
 
@@ -230,8 +248,17 @@ static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const FeedSta
     wtext(back, W, H, STRIDE, lx, ly, "NO JOBS", 2, dim_r, dim_g, dim_b);
     return;
   }
-  for (int i = 0; i < st->njobs; i++) {
-    int yy = ly + i * 44;
+  if (scroll < 0) scroll = 0;
+  if (scroll > st->njobs - 1) scroll = st->njobs - 1;
+  int shown = 0;
+  for (int i = scroll; i < st->njobs && shown < QUEUE_VISIBLE; i++, shown++) {
+    int yy = ly + shown * QUEUE_ROW_H;
+    // selected-row highlight band
+    if (i == sel) {
+      for (int by = -6; by < QUEUE_ROW_H - 8; by++)
+        for (int bx = -4; bx < QUEUE_PANEL_W - QUEUE_LX; bx++)
+          wput(back, W, H, STRIDE, lx + bx, yy + by, 0.10f, 0.16f, 0.22f);
+    }
     // status dot: green ok, red error, amber paused
     float dr, dg, db;
     if (st->status[i] == 1) { dr=err_r; dg=err_g; db=err_b; }
@@ -243,6 +270,76 @@ static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const FeedSta
     wtext(back, W, H, STRIDE, lx + 14, yy, st->names[i], 2, cyan_r, cyan_g, cyan_b);
     wtext(back, W, H, STRIDE, lx + 14, yy + 18, st->when[i], 1, dim_r, dim_g, dim_b);
   }
+  // scroll affordance: little up/down chevrons if more jobs exist off-screen
+  if (scroll > 0)
+    wtext(back, W, H, STRIDE, QUEUE_PANEL_W - 20, ly - 12, "-", 2, dim_r, dim_g, dim_b);
+  if (scroll + QUEUE_VISIBLE < st->njobs)
+    wtext(back, W, H, STRIDE, QUEUE_PANEL_W - 20, ly + (QUEUE_VISIBLE - 1) * QUEUE_ROW_H + 20, "_", 2, dim_r, dim_g, dim_b);
+}
+
+// Solid filled rectangle (opaque set) into the back buffer.
+static void wfill(uint16_t *back, int W, int H, int STRIDE, int x, int y, int w, int h,
+                  float r, float g, float b) {
+  for (int yy = 0; yy < h; yy++)
+    for (int xx = 0; xx < w; xx++)
+      wput(back, W, H, STRIDE, x + xx, y + yy, r, g, b);
+}
+
+// Detail overlay for a tapped job, drawn over the orb area. Returns nothing;
+// caller decides when to show it (sel >= 0). Panel bounds are fixed so the
+// touch handler can dismiss on taps outside them.
+#define OVL_X 300
+#define OVL_Y 130
+#define OVL_W 470
+#define OVL_H 210
+static void draw_job_detail(uint16_t *back, int W, int H, int STRIDE, const FeedStats *st, int sel) {
+  if (sel < 0 || sel >= st->njobs) return;
+  const float cyan_r = 0.35f, cyan_g = 0.75f, cyan_b = 0.95f;
+  const float dim_r = 0.55f, dim_g = 0.60f, dim_b = 0.68f;
+  const float lbl_r = 0.40f, lbl_g = 0.45f, lbl_b = 0.52f;
+
+  // panel background (dark) with a 1px cyan border and rounded-ish corners
+  wfill(back, W, H, STRIDE, OVL_X, OVL_Y, OVL_W, OVL_H, 0.04f, 0.07f, 0.10f);
+  for (int x = 0; x < OVL_W; x++) {
+    if (x < 6 || x > OVL_W - 7) continue; // corner nick for rounded look
+    wput(back, W, H, STRIDE, OVL_X + x, OVL_Y, cyan_r, cyan_g, cyan_b);
+    wput(back, W, H, STRIDE, OVL_X + x, OVL_Y + OVL_H - 1, cyan_r, cyan_g, cyan_b);
+  }
+  for (int y = 0; y < OVL_H; y++) {
+    if (y < 6 || y > OVL_H - 7) continue;
+    wput(back, W, H, STRIDE, OVL_X, OVL_Y + y, cyan_r, cyan_g, cyan_b);
+    wput(back, W, H, STRIDE, OVL_X + OVL_W - 1, OVL_Y + y, cyan_r, cyan_g, cyan_b);
+  }
+
+  int px = OVL_X + 18, py = OVL_Y + 16;
+  // status dot mirrors the row color
+  float dr, dg, db;
+  if (st->status[sel] == 1) { dr=0.95f; dg=0.30f; db=0.30f; }
+  else if (st->status[sel] == 2) { dr=0.95f; dg=0.75f; db=0.20f; }
+  else { dr=0.25f; dg=0.85f; db=0.45f; }
+  for (int a = 0; a < 12; a++) for (int b = 0; b < 12; b++)
+    if ((a-6)*(a-6)+(b-6)*(b-6) <= 36) wput(back, W, H, STRIDE, px+a, py+2+b, dr, dg, db);
+
+  wtext(back, W, H, STRIDE, px + 20, py, st->names[sel], 2, cyan_r, cyan_g, cyan_b);
+
+  py += 44;
+  wtext(back, W, H, STRIDE, px, py, "SCHEDULE", 1, lbl_r, lbl_g, lbl_b);
+  wtext(back, W, H, STRIDE, px, py + 12, st->schedule[sel], 2, dim_r, dim_g, dim_b);
+
+  py += 44;
+  wtext(back, W, H, STRIDE, px, py, "LAST STATUS", 1, lbl_r, lbl_g, lbl_b);
+  {
+    float sr = dim_r, sg = dim_g, sb = dim_b;
+    if (strncmp(st->laststat[sel], "ok", 2) == 0) { sr=0.25f; sg=0.85f; sb=0.45f; }
+    else if (strncmp(st->laststat[sel], "error", 5) == 0) { sr=0.95f; sg=0.30f; sb=0.30f; }
+    wtext(back, W, H, STRIDE, px, py + 12, st->laststat[sel], 2, sr, sg, sb);
+  }
+
+  py += 44;
+  wtext(back, W, H, STRIDE, px, py, "NEXT RUN", 1, lbl_r, lbl_g, lbl_b);
+  wtext(back, W, H, STRIDE, px, py + 12, st->when[sel], 2, cyan_r, cyan_g, cyan_b);
+
+  wtext(back, W, H, STRIDE, OVL_X + OVL_W - 96, OVL_Y + OVL_H - 16, "TAP OUT", 1, lbl_r, lbl_g, lbl_b);
 }
 
 // ---- agent / Hermes stats ----

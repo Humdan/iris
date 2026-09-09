@@ -16,6 +16,10 @@
 #include <signal.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
+#include <poll.h>
+#include <errno.h>
+#include <linux/input.h>
 #include "iris_widgets.h"
 
 #define NPART 700          // particles on the shell
@@ -104,6 +108,86 @@ static void spawn_spark(float theta, float phi, float r, float act) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Touch input: a dedicated thread reads /dev/input/event4 (evdev, FT5x06) and
+// publishes the single active finger's state into a mutex-guarded struct. The
+// render loop only SAMPLES it once per frame — never reads the device — so the
+// 60Hz absolute-clock pacing is never blocked by touch I/O.
+// ---------------------------------------------------------------------------
+#define TOUCH_DEV "/dev/input/event4"
+
+typedef struct {
+    pthread_mutex_t m;
+    int   down;         // finger currently on the glass
+    int   x, y;         // latest position (screen pixels, 800x480)
+    // per-contact event stream: monotonically bumped so the loop can detect
+    // fresh down/up transitions and movement without racing.
+    int   seq_down;     // incremented on each finger-down
+    int   seq_up;       // incremented on each finger-up
+    int   down_x, down_y; // where the current/last contact began
+    int   up_x, up_y;     // where the last contact ended
+} TouchState;
+
+static TouchState touch = { .m = PTHREAD_MUTEX_INITIALIZER, .down = 0, .x = 0, .y = 0,
+                            .seq_down = 0, .seq_up = 0 };
+
+static void *touch_thread(void *arg) {
+    (void)arg;
+    int tfd = open(TOUCH_DEV, O_RDONLY);
+    if (tfd < 0) {
+        fprintf(stderr, "touch: open %s failed: %s (gestures disabled)\n", TOUCH_DEV, strerror(errno));
+        return NULL;
+    }
+    fprintf(stderr, "touch: reading %s\n", TOUCH_DEV);
+
+    int cur_x = 0, cur_y = 0;   // accumulated within the current SYN frame
+    int have_x = 0, have_y = 0;
+    int contact = 0;            // tracking-id >= 0 means finger present
+
+    struct pollfd pfd = { .fd = tfd, .events = POLLIN };
+    struct input_event ev;
+
+    while (running) {
+        int pr = poll(&pfd, 1, 200);   // 200ms wakeups so we notice `running`
+        if (pr <= 0) continue;
+        ssize_t n = read(tfd, &ev, sizeof(ev));
+        if (n != (ssize_t)sizeof(ev)) continue;
+
+        if (ev.type == EV_ABS) {
+            if (ev.code == ABS_MT_POSITION_X) { cur_x = ev.value; have_x = 1; }
+            else if (ev.code == ABS_MT_POSITION_Y) { cur_y = ev.value; have_y = 1; }
+            else if (ev.code == ABS_MT_TRACKING_ID) {
+                if (ev.value < 0) {          // finger lifted
+                    pthread_mutex_lock(&touch.m);
+                    if (touch.down) { touch.up_x = touch.x; touch.up_y = touch.y; touch.seq_up++; }
+                    touch.down = 0;
+                    pthread_mutex_unlock(&touch.m);
+                    contact = 0;
+                } else {                      // new contact
+                    contact = 1;
+                }
+            }
+        } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+            // commit this frame's accumulated position
+            if (have_x || have_y || contact) {
+                pthread_mutex_lock(&touch.m);
+                if (have_x) touch.x = cur_x;
+                if (have_y) touch.y = cur_y;
+                if (contact && !touch.down) {  // rising edge: finger-down
+                    touch.down = 1;
+                    touch.down_x = touch.x;
+                    touch.down_y = touch.y;
+                    touch.seq_down++;
+                }
+                pthread_mutex_unlock(&touch.m);
+            }
+            have_x = have_y = 0;
+        }
+    }
+    close(tfd);
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     const char *state_file = argc > 1 ? argv[1] : "/tmp/iris_state";
     signal(SIGINT, on_sig);
@@ -152,11 +236,136 @@ int main(int argc, char **argv) {
     FeedStats stats; read_stats(&stats);   // clock + tool-call feed, refreshed ~1 Hz below
     AgentStats agent; read_agent_stats(&agent);
 
+    // --- touch: spawn the reader thread; render loop only samples shared state ---
+    pthread_t tid;
+    int have_touch_thread = (pthread_create(&tid, NULL, touch_thread, NULL) == 0);
+    if (!have_touch_thread) fprintf(stderr, "touch: pthread_create failed (gestures disabled)\n");
+
+    // gesture / interaction state (owned by the render loop)
+    float touch_offset = 0.0f;   // extra Y-axis (yaw) angle added to auto rotation
+    float touch_vel    = 0.0f;   // yaw angular velocity injected by horizontal drag (rad/s)
+    float pitch_offset = 0.0f;   // extra X-axis (pitch) angle from vertical drag
+    float pitch_vel    = 0.0f;   // pitch angular velocity (rad/s)
+    float scroll_f     = 0.0f;   // eased scroll position (fractional job index)
+    int   scroll_target = 0;     // integer scroll goal, adjusted by vertical swipe
+    int   sel_job      = -1;     // selected job for detail overlay, -1 = none
+
+    // per-gesture bookkeeping tracked across frames
+    int   last_seq_down = 0, last_seq_up = 0;
+    int   prev_down = 0;
+    int   prev_x = 0, prev_y = 0;
+    double prev_sample_t = now();
+    int   gesture_is_vertical = 0, gesture_is_horizontal = 0, gesture_decided = 0;
+    int   gesture_scroll_anchor = 0;      // scroll_target at gesture start
+    int   gesture_down_y = 0, gesture_down_x = 0;
+
     while (running) {
         double t = now();
         float dt = (float)(t - tlast); tlast = t;
         if (dt > 0.05f) dt = 0.05f;
         global_time += dt;
+
+        // ---------------- sample touch & drive gestures ----------------
+        // Snapshot the shared touch state under the mutex, then release it fast.
+        int td, tx, ty, sdn, sup, dnx, dny, upx, upy;
+        pthread_mutex_lock(&touch.m);
+        td = touch.down; tx = touch.x; ty = touch.y;
+        sdn = touch.seq_down; sup = touch.seq_up;
+        dnx = touch.down_x; dny = touch.down_y; upx = touch.up_x; upy = touch.up_y;
+        pthread_mutex_unlock(&touch.m);
+
+        // NEW finger-down this frame?
+        if (sdn != last_seq_down) {
+            last_seq_down = sdn;
+            gesture_decided = 0; gesture_is_vertical = 0; gesture_is_horizontal = 0;
+            gesture_down_x = dnx; gesture_down_y = dny;
+            gesture_scroll_anchor = scroll_target;
+            prev_x = tx; prev_y = ty;
+        }
+
+        // While the finger is down, classify and act on movement.
+        // Region gate: a drag that STARTS on the left queue panel is a vertical
+        // scroll gesture; a drag anywhere else rotates the sphere freely in BOTH
+        // axes at once (horizontal -> yaw, vertical -> pitch, diagonal -> both).
+        if (td) {
+            double dts = t - prev_sample_t; if (dts <= 0) dts = 1.0/60.0;
+            int dx = tx - prev_x, dy = ty - prev_y;
+            int total_dx = tx - gesture_down_x, total_dy = ty - gesture_down_y;
+            int started_in_panel = (gesture_down_x < QUEUE_PANEL_W);
+
+            // decide gesture kind once movement exceeds a small threshold
+            if (!gesture_decided && (abs(total_dx) > 8 || abs(total_dy) > 8)) {
+                gesture_decided = 1;
+                if (started_in_panel && abs(total_dy) >= abs(total_dx))
+                    gesture_is_vertical = 1;     // swipe-scroll the queue
+                else
+                    gesture_is_horizontal = 1;   // free rotate the sphere (yaw + pitch)
+            }
+
+            if (gesture_is_horizontal) {
+                // free-drag rotation: horizontal -> yaw, vertical -> pitch. 900px ~ 2pi.
+                // Signs chosen so the sphere follows the finger: drag down tips the
+                // top toward the viewer. (Yaw sign left as-is; flip if it reads reversed.)
+                float ang_per_px = 6.2831853f / 900.0f;
+                touch_vel   = (float)dx * ang_per_px / (float)dts;   // yaw velocity
+                touch_offset += (float)dx * ang_per_px;              // immediate yaw follow
+                pitch_vel   = (float)dy * ang_per_px / (float)dts;   // pitch velocity
+                pitch_offset += (float)dy * ang_per_px;              // immediate pitch follow
+            } else if (gesture_is_vertical) {
+                // swipe up -> scroll down the list; QUEUE_ROW_H px per job
+                int rows = -total_dy / QUEUE_ROW_H;   // finger up (dy<0) advances list
+                scroll_target = gesture_scroll_anchor + rows;
+            }
+            prev_x = tx; prev_y = ty;
+            prev_sample_t = t;
+        }
+
+        // finger-UP this frame? resolve tap vs. fling.
+        if (sup != last_seq_up) {
+            last_seq_up = sup;
+            int mv = abs(upx - gesture_down_x) + abs(upy - gesture_down_y);
+            if (mv < 15) {
+                // TAP — hit-test against queue rows / overlay / elsewhere
+                int handled = 0;
+                if (sel_job >= 0 &&
+                    upx >= OVL_X && upx < OVL_X + OVL_W &&
+                    upy >= OVL_Y && upy < OVL_Y + OVL_H) {
+                    handled = 1;   // tap inside the overlay: keep it open
+                }
+                if (!handled && upx < QUEUE_PANEL_W && upy >= QUEUE_LY - 6) {
+                    int row = (upy - QUEUE_LY) / QUEUE_ROW_H;
+                    int idx = scroll_target + row;
+                    if (row >= 0 && row < QUEUE_VISIBLE && idx >= 0 && idx < stats.njobs) {
+                        sel_job = (sel_job == idx) ? -1 : idx;  // toggle
+                        handled = 1;
+                    }
+                }
+                if (!handled) sel_job = -1;   // tap elsewhere dismisses overlay
+            }
+            // horizontal fling already left momentum in touch_vel; nothing more to do
+        }
+
+        // clamp scroll target to valid range and ease scroll_f toward it
+        {
+            int maxs = stats.njobs - QUEUE_VISIBLE; if (maxs < 0) maxs = 0;
+            if (scroll_target < 0) scroll_target = 0;
+            if (scroll_target > maxs) scroll_target = maxs;
+            scroll_f += ((float)scroll_target - scroll_f) * (1.0f - expf(-12.0f * dt));
+        }
+
+        // Touch-driven rotation: when no finger drives it, momentum coasts and
+        // the accumulated offsets DECAY smoothly back to 0 so auto-rotation
+        // resumes with no snap. Everything eased — no velocity discontinuity.
+        if (!(td && gesture_is_horizontal)) {
+            touch_offset += touch_vel * dt;               // coast on released yaw momentum
+            touch_vel   -= touch_vel * (1.0f - expf(-2.5f * dt));   // friction on yaw velocity
+            touch_offset -= touch_offset * (1.0f - expf(-0.6f * dt)); // ease yaw offset home
+            pitch_offset += pitch_vel * dt;               // coast on released pitch momentum
+            pitch_vel   -= pitch_vel * (1.0f - expf(-2.5f * dt));    // friction on pitch velocity
+            pitch_offset -= pitch_offset * (1.0f - expf(-0.6f * dt)); // ease pitch offset home
+        }
+        prev_down = td; (void)prev_down;
+        // ---------------------------------------------------------------
 
         // --- read activity state (0..1, or thinking/idle keywords) ---
         if (t - tcheck > 0.1) {
@@ -180,8 +389,9 @@ int main(int argc, char **argv) {
         float phase = fmodf(global_time, period) / period;
         float tri = phase < 0.5f ? phase * 2.0f : (1.0f - phase) * 2.0f;
         float eased = tri * tri * tri * (tri * (tri * 6.0f - 15.0f) + 10.0f);
-        float rot = eased * 6.2831853f;
-        float cr = cosf(rot), sr = sinf(rot);
+        float rot = eased * 6.2831853f + touch_offset;   // yaw = auto + touch-driven offset
+        float cr = cosf(rot), sr = sinf(rot);             // yaw (Y-axis)
+        float cp = cosf(pitch_offset), sp = sinf(pitch_offset);  // pitch (X-axis), touch-only
 
         // drift speed scales gently with activity
         float drift = 0.5f + 1.3f * act;
@@ -219,13 +429,19 @@ int main(int argc, char **argv) {
             float sx = sinf(p->phi) * cosf(p->theta) * p->r;
             float sy = cosf(p->phi) * p->r;
             float sz = sinf(p->phi) * sinf(p->theta) * p->r;
-            // rotate about Y
-            float xr = sx * cr + sz * sr;
-            float zr = -sx * sr + sz * cr;
+            // Apply pitch FIRST (about the SCREEN x-axis) then yaw (about world Y).
+            // Order matters: pitching before yaw keeps "up is always up" no matter
+            // how far the sphere has been spun, so a vertical drag always tips the
+            // top toward/away from the viewer instead of flipping once yaw>90deg.
+            float y1 = sy * cp - sz * sp;   // pitch tilts (y,z)
+            float z1 = sy * sp + sz * cp;
+            float xr = sx * cr + z1 * sr;   // yaw about Y
+            float zr2 = -sx * sr + z1 * cr;
+            float yr2 = y1;
 
-            float depth = 0.80f + 0.20f * zr;   // 0.6..1.0, front = brighter/bigger
+            float depth = 0.80f + 0.20f * zr2;   // 0.6..1.0, front = brighter/bigger
             float px = ox + xr * escale * depth;
-            float py = oy + sy * escale * depth;
+            float py = oy + yr2 * escale * depth;
 
             // brightness: brighter baseline, gentle twinkle, lifts with activity, dims with depth
             float tw = 0.75f + 0.25f * sinf(p->twinkle);
@@ -252,11 +468,15 @@ int main(int argc, char **argv) {
             if (s->life <= 0) continue;
             s->x += s->vx * dt; s->y += s->vy * dt; s->z += s->vz * dt;
             s->life -= dt * 0.9f;
-            float xr = s->x * cr + s->z * sr;
-            float zr = -s->x * sr + s->z * cr;
-            float depth = 0.80f + 0.20f * zr;
+            // same pitch-first-then-yaw order as the particles (screen-relative pitch)
+            float y1 = s->y * cp - s->z * sp;
+            float z1 = s->y * sp + s->z * cp;
+            float xr = s->x * cr + z1 * sr;
+            float zr2 = -s->x * sr + z1 * cr;
+            float yr2 = y1;
+            float depth = 0.80f + 0.20f * zr2;
             float px = ox + xr * escale * depth;
-            float py = oy + s->y * escale * depth;
+            float py = oy + yr2 * escale * depth;
             float fade = smoothstep(0, 0.2f, s->life);
             dot_16(back, W, H, STRIDE, px, py, 2.0f + 2.0f * fade,
                    0.5f * fade, 0.8f * fade, 1.0f * fade);
@@ -264,8 +484,10 @@ int main(int argc, char **argv) {
 
         // --- widgets: clock + system stats + agent panel on top of the orb ---
         if (t - tstats > 1.0) { tstats = t; read_stats(&stats); read_agent_stats(&agent); }
-        draw_widgets(back, W, H, STRIDE, &stats);
+        if (sel_job >= stats.njobs) sel_job = -1;   // job vanished from queue
+        draw_widgets(back, W, H, STRIDE, &stats, (int)(scroll_f + 0.5f), sel_job);
         draw_agent_panel(back, W, H, STRIDE, &agent);
+        if (sel_job >= 0) draw_job_detail(back, W, H, STRIDE, &stats, sel_job);
 
         // --- blit atomically ---
         memcpy(fb_raw, back_raw, fbsize);
@@ -284,6 +506,7 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr, "iris_fb: shutting down\n");
+    if (have_touch_thread) pthread_join(tid, NULL);
     memset(fb_raw, 0, fbsize);
     free(back_raw);
     munmap(fb_raw, fbsize);

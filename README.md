@@ -61,7 +61,7 @@ call and streamed token kicks it up; silence lets it fall to zero in ~2 s.
 `iris_fb` scales firing rate, drift and brightness continuously with it.
 
 ```bash
-ln -s ~/iris/plugin ~/.hermes/plugins/iris
+ln -s ~/dev/iris/plugin ~/.hermes/plugins/iris
 hermes plugins enable iris        # takes effect in the next Hermes session
 ```
 
