@@ -304,6 +304,8 @@ int main(int argc, char **argv) {
 
             if (gesture_is_horizontal) {
                 // free-drag rotation: horizontal -> yaw, vertical -> pitch. 900px ~ 2pi.
+                // Signs chosen so the sphere follows the finger: drag down tips the
+                // top toward the viewer. (Yaw sign left as-is; flip if it reads reversed.)
                 float ang_per_px = 6.2831853f / 900.0f;
                 touch_vel   = (float)dx * ang_per_px / (float)dts;   // yaw velocity
                 touch_offset += (float)dx * ang_per_px;              // immediate yaw follow
@@ -427,12 +429,15 @@ int main(int argc, char **argv) {
             float sx = sinf(p->phi) * cosf(p->theta) * p->r;
             float sy = cosf(p->phi) * p->r;
             float sz = sinf(p->phi) * sinf(p->theta) * p->r;
-            // rotate about Y (yaw)
-            float xr = sx * cr + sz * sr;
-            float zr = -sx * sr + sz * cr;
-            // then rotate about X (pitch): tips (sy, zr)
-            float yr2 = sy * cp - zr * sp;
-            float zr2 = sy * sp + zr * cp;
+            // Apply pitch FIRST (about the SCREEN x-axis) then yaw (about world Y).
+            // Order matters: pitching before yaw keeps "up is always up" no matter
+            // how far the sphere has been spun, so a vertical drag always tips the
+            // top toward/away from the viewer instead of flipping once yaw>90deg.
+            float y1 = sy * cp - sz * sp;   // pitch tilts (y,z)
+            float z1 = sy * sp + sz * cp;
+            float xr = sx * cr + z1 * sr;   // yaw about Y
+            float zr2 = -sx * sr + z1 * cr;
+            float yr2 = y1;
 
             float depth = 0.80f + 0.20f * zr2;   // 0.6..1.0, front = brighter/bigger
             float px = ox + xr * escale * depth;
@@ -463,10 +468,12 @@ int main(int argc, char **argv) {
             if (s->life <= 0) continue;
             s->x += s->vx * dt; s->y += s->vy * dt; s->z += s->vz * dt;
             s->life -= dt * 0.9f;
-            float xr = s->x * cr + s->z * sr;
-            float zr = -s->x * sr + s->z * cr;
-            float yr2 = s->y * cp - zr * sp;
-            float zr2 = s->y * sp + zr * cp;
+            // same pitch-first-then-yaw order as the particles (screen-relative pitch)
+            float y1 = s->y * cp - s->z * sp;
+            float z1 = s->y * sp + s->z * cp;
+            float xr = s->x * cr + z1 * sr;
+            float zr2 = -s->x * sr + z1 * cr;
+            float yr2 = y1;
             float depth = 0.80f + 0.20f * zr2;
             float px = ox + xr * escale * depth;
             float py = oy + yr2 * escale * depth;

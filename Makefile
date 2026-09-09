@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -O2 -ffast-math
+CFLAGS ?= -O3 -ffast-math -march=native -mtune=native
 iris_fb: iris_fb.c
 	$(CC) $(CFLAGS) -o $@ $< -lm -lpthread
 clean:
