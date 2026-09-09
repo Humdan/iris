@@ -27,6 +27,23 @@
 
 static volatile int running = 1;
 static void on_sig(int s) { (void)s; running = 0; }
+
+// Fire the Night shift cron job in a detached child so the render loop never
+// blocks. SIGCHLD is set to SIG_IGN at startup so exited children are reaped
+// automatically (no zombies, no waitpid in the loop).
+static void ns_fire_job(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        // child: silence stdio, exec the hermes CLI, then vanish
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
+        execl("/home/humdan/.local/bin/hermes", "hermes", "cron", "run",
+              NS_JOB_ID, (char *)NULL);
+        _exit(127);   // exec failed
+    }
+    // parent returns immediately; SIG_IGN on SIGCHLD reaps the child.
+}
+
 static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec * 1e-9; }
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
 static float frand(void) { return rand() / (float)RAND_MAX; }
@@ -192,6 +209,7 @@ int main(int argc, char **argv) {
     const char *state_file = argc > 1 ? argv[1] : "/tmp/iris_state";
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
+    signal(SIGCHLD, SIG_IGN);   // auto-reap forked hermes-cron children (no zombies)
 
     int fd = open("/dev/fb0", O_RDWR);
     if (fd < 0) { perror("open /dev/fb0"); return 1; }
@@ -249,6 +267,12 @@ int main(int argc, char **argv) {
     float scroll_f     = 0.0f;   // eased scroll position (fractional job index)
     int   scroll_target = 0;     // integer scroll goal, adjusted by vertical swipe
     int   sel_job      = -1;     // selected job for detail overlay, -1 = none
+
+    // Night shift CONSOLE state: transcript cache refreshed ~1Hz, plus a brief
+    // FIRING feedback timestamp set when the RUN NOW button is tapped.
+    NightConsole ns_con; memset(&ns_con, 0, sizeof(ns_con));
+    double ns_last_read = 0;     // last transcript read (monotonic)
+    double ns_fire_at   = -1e9;  // time RUN NOW was tapped; FIRING shows for ~2.5s
 
     // per-gesture bookkeeping tracked across frames
     int   last_seq_down = 0, last_seq_up = 0;
@@ -331,12 +355,21 @@ int main(int argc, char **argv) {
                     upx >= OVL_X && upx < OVL_X + OVL_W &&
                     upy >= OVL_Y && upy < OVL_Y + OVL_H) {
                     handled = 1;   // tap inside the overlay: keep it open
+                    // Night shift console: RUN NOW button fires the cron job.
+                    if (strcmp(stats.names[sel_job], NS_JOB_NAME) == 0 &&
+                        upx >= NS_BTN_X && upx < NS_BTN_X + NS_BTN_W &&
+                        upy >= NS_BTN_Y && upy < NS_BTN_Y + NS_BTN_H) {
+                        ns_fire_job();          // fork+exec detached; returns instantly
+                        ns_fire_at = t;         // show FIRING feedback briefly
+                    }
                 }
                 if (!handled && upx < QUEUE_PANEL_W && upy >= QUEUE_LY - 6) {
                     int row = (upy - QUEUE_LY) / QUEUE_ROW_H;
                     int idx = scroll_target + row;
                     if (row >= 0 && row < QUEUE_VISIBLE && idx >= 0 && idx < stats.njobs) {
                         sel_job = (sel_job == idx) ? -1 : idx;  // toggle
+                        if (sel_job >= 0 && strcmp(stats.names[sel_job], NS_JOB_NAME) == 0)
+                            ns_last_read = 0;   // force an immediate transcript read on open
                         handled = 1;
                     }
                 }
@@ -485,9 +518,19 @@ int main(int argc, char **argv) {
         // --- widgets: clock + system stats + agent panel on top of the orb ---
         if (t - tstats > 1.0) { tstats = t; read_stats(&stats); read_agent_stats(&agent); }
         if (sel_job >= stats.njobs) sel_job = -1;   // job vanished from queue
+        // Refresh the Night shift transcript ~1Hz (only while its console is open).
+        int ns_open = (sel_job >= 0 && strcmp(stats.names[sel_job], NS_JOB_NAME) == 0);
+        if (ns_open && t - ns_last_read > 1.0) { ns_last_read = t; ns_read_transcript(&ns_con); }
         draw_widgets(back, W, H, STRIDE, &stats, (int)(scroll_f + 0.5f), sel_job);
         draw_agent_panel(back, W, H, STRIDE, &agent);
-        if (sel_job >= 0) draw_job_detail(back, W, H, STRIDE, &stats, sel_job);
+        if (sel_job >= 0) {
+            if (ns_open) {
+                int firing = (t - ns_fire_at) < 2.5;   // brief RUN NOW feedback
+                draw_night_console(back, W, H, STRIDE, &stats, sel_job, &ns_con, firing);
+            } else {
+                draw_job_detail(back, W, H, STRIDE, &stats, sel_job);
+            }
+        }
 
         // --- blit atomically ---
         memcpy(fb_raw, back_raw, fbsize);

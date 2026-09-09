@@ -9,6 +9,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 // ---- 5x7 bitmap font: ASCII 32..90 (space..Z) + a few punctuation. ----
 // Each glyph is 5 columns x 7 rows, stored as 5 bytes (low 7 bits = rows top->bottom).
@@ -292,6 +294,194 @@ static void wfill(uint16_t *back, int W, int H, int STRIDE, int x, int y, int w,
 #define OVL_Y 130
 #define OVL_W 470
 #define OVL_H 210
+
+// ---- Night shift CONSOLE mode ----
+// The "Night shift" job (id b7a26b64f480) gets a special overlay: a live-tailing
+// transcript of its newest run output plus a RUN NOW tap-zone button.
+#define NS_JOB_NAME  "Night shift"
+#define NS_JOB_ID    "b7a26b64f480"
+#define NS_OUT_DIR   "/home/humdan/.hermes/cron/output/" NS_JOB_ID
+// RUN NOW button: bottom-right inside the panel. Bounds derived from OVL_* so the
+// tap handler in iris_fb.c can hit-test the exact same rectangle.
+#define NS_BTN_W 120
+#define NS_BTN_H 34
+#define NS_BTN_X (OVL_X + OVL_W - NS_BTN_W - 12)
+#define NS_BTN_Y (OVL_Y + OVL_H - NS_BTN_H - 12)
+
+// Transcript cache: filled by ns_read_transcript() at ~1Hz, drawn every frame.
+#define NS_MAX_LINES 12
+#define NS_LINE_LEN  60
+typedef struct {
+  char   lines[NS_MAX_LINES][NS_LINE_LEN];
+  int    nlines;
+  int    have;          // 1 if a run file was found
+  time_t mtime;         // newest output file mtime
+  int    running;       // fresh output (< ~20s) => job appears to be running
+} NightConsole;
+
+// Return the newest *.md file path in the Night shift output dir into `out`.
+// Returns 1 on success, 0 if dir missing / empty.
+static int ns_newest_file(char *out, int outsz) {
+  DIR *d = opendir(NS_OUT_DIR);
+  if (!d) return 0;
+  struct dirent *de;
+  char best[512] = {0};
+  time_t best_m = 0;
+  while ((de = readdir(d)) != NULL) {
+    const char *nm = de->d_name;
+    size_t l = strlen(nm);
+    if (l < 4 || strcmp(nm + l - 3, ".md") != 0) continue;
+    char full[512];
+    snprintf(full, sizeof(full), "%s/%s", NS_OUT_DIR, nm);
+    struct stat sb;
+    if (stat(full, &sb) != 0) continue;
+    if (sb.st_mtime >= best_m) { best_m = sb.st_mtime; snprintf(best, sizeof(best), "%s", full); }
+  }
+  closedir(d);
+  if (!best[0]) return 0;
+  snprintf(out, outsz, "%s", best);
+  return 1;
+}
+
+// Cheap, bounded, non-blocking-ish read: open newest run file, seek to the last
+// '## Response' section, keep the LAST NS_MAX_LINES non-empty lines (truncated to
+// NS_LINE_LEN). Meant to be called ~1Hz off the render cadence, not per frame.
+static void ns_read_transcript(NightConsole *nc) {
+  nc->have = 0; nc->nlines = 0; nc->running = 0; nc->mtime = 0;
+  char path[512];
+  if (!ns_newest_file(path, sizeof(path))) return;
+  struct stat sb;
+  if (stat(path, &sb) == 0) {
+    nc->mtime = sb.st_mtime;
+    nc->running = (time(NULL) - sb.st_mtime) < 20;
+  }
+  FILE *f = fopen(path, "r");
+  if (!f) return;
+  nc->have = 1;
+
+  // ring buffer of the last NS_MAX_LINES lines that appear AFTER '## Response'
+  char ring[NS_MAX_LINES][NS_LINE_LEN];
+  int  rn = 0, rhead = 0;
+  int  after = 0;
+  char raw[1024];
+  while (fgets(raw, sizeof(raw), f)) {
+    // strip trailing newline / CR
+    size_t l = strlen(raw);
+    while (l > 0 && (raw[l-1] == '\n' || raw[l-1] == '\r')) raw[--l] = 0;
+    if (!after) {
+      if (strncmp(raw, "## Response", 11) == 0) after = 1;
+      continue;
+    }
+    if (raw[0] == 0) continue;   // skip blank lines to pack the panel
+    // store truncated line into the ring
+    char *slot = ring[rhead];
+    int i = 0;
+    for (const char *p = raw; *p && i < NS_LINE_LEN - 1; p++) {
+      char c = *p;
+      if (c == '\t') c = ' ';
+      slot[i++] = c;
+    }
+    slot[i] = 0;
+    rhead = (rhead + 1) % NS_MAX_LINES;
+    if (rn < NS_MAX_LINES) rn++;
+  }
+  fclose(f);
+
+  // emit ring in chronological order into nc->lines
+  int start = (rhead - rn + NS_MAX_LINES) % NS_MAX_LINES;
+  for (int k = 0; k < rn; k++) {
+    int idx = (start + k) % NS_MAX_LINES;
+    memcpy(nc->lines[k], ring[idx], NS_LINE_LEN);
+  }
+  nc->nlines = rn;
+}
+
+// Draw the Night shift CONSOLE overlay: transcript tail + status line + RUN NOW.
+// `firing_active` = 1 while showing the brief FIRING feedback after a tap.
+static void draw_night_console(uint16_t *back, int W, int H, int STRIDE,
+                               const FeedStats *st, int sel,
+                               const NightConsole *nc, int firing_active) {
+  const float cyan_r = 0.35f, cyan_g = 0.75f, cyan_b = 0.95f;
+  const float dim_r = 0.55f, dim_g = 0.60f, dim_b = 0.68f;
+  const float ok_r = 0.25f, ok_g = 0.85f, ok_b = 0.45f;
+
+  // panel background + border (same style as the plain detail overlay)
+  wfill(back, W, H, STRIDE, OVL_X, OVL_Y, OVL_W, OVL_H, 0.04f, 0.07f, 0.10f);
+  for (int x = 0; x < OVL_W; x++) {
+    if (x < 6 || x > OVL_W - 7) continue;
+    wput(back, W, H, STRIDE, OVL_X + x, OVL_Y, cyan_r, cyan_g, cyan_b);
+    wput(back, W, H, STRIDE, OVL_X + x, OVL_Y + OVL_H - 1, cyan_r, cyan_g, cyan_b);
+  }
+  for (int y = 0; y < OVL_H; y++) {
+    if (y < 6 || y > OVL_H - 7) continue;
+    wput(back, W, H, STRIDE, OVL_X, OVL_Y + y, cyan_r, cyan_g, cyan_b);
+    wput(back, W, H, STRIDE, OVL_X + OVL_W - 1, OVL_Y + y, cyan_r, cyan_g, cyan_b);
+  }
+
+  int px = OVL_X + 16, py = OVL_Y + 12;
+  // title
+  wtext(back, W, H, STRIDE, px, py, st->names[sel], 2, cyan_r, cyan_g, cyan_b);
+
+  // status line: running vs idle+last-run time
+  {
+    char sbuf[48];
+    float sr, sg, sb;
+    if (firing_active) { snprintf(sbuf, sizeof(sbuf), "FIRING..."); sr=0.95f; sg=0.75f; sb=0.20f; }
+    else if (!nc->have) { snprintf(sbuf, sizeof(sbuf), "NO RUNS YET"); sr=dim_r; sg=dim_g; sb=dim_b; }
+    else if (nc->running) { snprintf(sbuf, sizeof(sbuf), "RUNNING..."); sr=ok_r; sg=ok_g; sb=ok_b; }
+    else {
+      time_t d = time(NULL) - nc->mtime;
+      if (d < 60) snprintf(sbuf, sizeof(sbuf), "IDLE - %lldS AGO", (long long)d);
+      else if (d < 3600) snprintf(sbuf, sizeof(sbuf), "IDLE - %lldM AGO", (long long)(d/60));
+      else if (d < 86400) snprintf(sbuf, sizeof(sbuf), "IDLE - %lldH AGO", (long long)(d/3600));
+      else snprintf(sbuf, sizeof(sbuf), "IDLE - %lldD AGO", (long long)(d/86400));
+      sr=dim_r; sg=dim_g; sb=dim_b;
+    }
+    wtext(back, W, H, STRIDE, px + 12 * 6 * 2, py + 2, sbuf, 1, sr, sg, sb);
+  }
+
+  // transcript area (small font, one line per row)
+  int ty = py + 26;
+  int line_h = 11;   // scale-1 glyph is 7px tall + gap
+  if (!nc->have || nc->nlines == 0) {
+    wtext(back, W, H, STRIDE, px, ty, nc->have ? "(EMPTY RESPONSE)" : "NO RUNS YET",
+          1, dim_r, dim_g, dim_b);
+  } else {
+    // how many lines fit above the button row
+    int avail = (NS_BTN_Y - 6 - ty) / line_h;
+    if (avail > nc->nlines) avail = nc->nlines;
+    if (avail > NS_MAX_LINES) avail = NS_MAX_LINES;
+    int first = nc->nlines - avail; if (first < 0) first = 0;
+    for (int k = 0; k < avail; k++) {
+      wtext(back, W, H, STRIDE, px, ty + k * line_h, nc->lines[first + k], 1,
+            dim_r, dim_g, dim_b);
+    }
+  }
+
+  // RUN NOW button (bottom-right), bordered rectangle
+  {
+    float br = firing_active ? 0.95f : cyan_r;
+    float bg = firing_active ? 0.75f : cyan_g;
+    float bb = firing_active ? 0.20f : cyan_b;
+    // fill
+    wfill(back, W, H, STRIDE, NS_BTN_X, NS_BTN_Y, NS_BTN_W, NS_BTN_H,
+          0.08f, 0.12f, 0.16f);
+    // border
+    for (int x = 0; x < NS_BTN_W; x++) {
+      wput(back, W, H, STRIDE, NS_BTN_X + x, NS_BTN_Y, br, bg, bb);
+      wput(back, W, H, STRIDE, NS_BTN_X + x, NS_BTN_Y + NS_BTN_H - 1, br, bg, bb);
+    }
+    for (int y = 0; y < NS_BTN_H; y++) {
+      wput(back, W, H, STRIDE, NS_BTN_X, NS_BTN_Y + y, br, bg, bb);
+      wput(back, W, H, STRIDE, NS_BTN_X + NS_BTN_W - 1, NS_BTN_Y + y, br, bg, bb);
+    }
+    const char *label = firing_active ? "FIRING" : "RUN NOW";
+    int lw = (int)strlen(label) * 6 * 2;
+    wtext(back, W, H, STRIDE, NS_BTN_X + (NS_BTN_W - lw) / 2, NS_BTN_Y + 10,
+          label, 2, br, bg, bb);
+  }
+}
+
 static void draw_job_detail(uint16_t *back, int W, int H, int STRIDE, const FeedStats *st, int sel) {
   if (sel < 0 || sel >= st->njobs) return;
   const float cyan_r = 0.35f, cyan_g = 0.75f, cyan_b = 0.95f;
