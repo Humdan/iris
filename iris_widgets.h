@@ -134,6 +134,7 @@ typedef struct {
   char schedule[CRON_MAX][40];    // human schedule display, e.g. "every day at 7am"
   char laststat[CRON_MAX][16];    // last_status text: ok / error / (none)
   char nextiso[CRON_MAX][40];     // raw next_run_at ISO string
+  int  is_ns[CRON_MAX];           // 1 if this is a night-shift task (drawn red in queue)
 } FeedStats;
 
 // Grab the string value of "key":"...": into out (bounded). Returns 1 on hit.
@@ -171,6 +172,23 @@ static void when_label(const char *iso, char *out, int outsz) {
   else snprintf(out, outsz, "IN %ldD", d/86400);
 }
 
+// True if a job's FULL name denotes a night-shift task: exactly the recurring
+// "Night shift" job, or an overnight one-shot (name contains "overnight"). Matched
+// on the full name at parse time (before display-truncation) so "TokenTimes redesign
+// ... one-shot overnight" is caught, and matched EXACTLY for "Night shift" so unrelated
+// jobs like "LED red midnight" are NOT (no fuzzy "night" substring).
+static int ns_is_nightshift(const char *name) {
+  if (!name) return 0;
+  if (strcmp(name, "Night shift") == 0) return 1;
+  for (const char *p = name; *p; p++) {
+    if ((p[0]=='o'||p[0]=='O') && (p[1]=='v'||p[1]=='V') && (p[2]=='e'||p[2]=='E') &&
+        (p[3]=='r'||p[3]=='R') && (p[4]=='n'||p[4]=='N') && (p[5]=='i'||p[5]=='I') &&
+        (p[6]=='g'||p[6]=='G') && (p[7]=='h'||p[7]=='H') && (p[8]=='t'||p[8]=='T'))
+      return 1;
+  }
+  return 0;
+}
+
 static void read_stats(FeedStats *st) {
   time_t now = time(NULL);
   struct tm *tm = localtime(&now);
@@ -192,7 +210,7 @@ static void read_stats(FeedStats *st) {
     const char *nextid = strstr(idp + 4, "\"id\"");
     const char *end = nextid ? nextid : buf + nlen;
 
-    char name[22], when_iso[40], status[16], enabled[8], state[20], sched[40];
+    char name[128], when_iso[40], status[16], enabled[8], state[20], sched[40];
     json_str(idp, end, "name", name, sizeof(name));
     json_str(idp, end, "next_run_at", when_iso, sizeof(when_iso));
     json_str(idp, end, "last_status", status, sizeof(status));
@@ -212,6 +230,7 @@ static void read_stats(FeedStats *st) {
     if (!is_enabled || (state[0] && strncmp(state, "paused", 6) == 0)) s = 2;
     else if (strncmp(status, "error", 5) == 0) s = 1;
     st->status[st->njobs] = s;
+    st->is_ns[st->njobs] = ns_is_nightshift(name);
 
     st->njobs++;
     p = end;
@@ -268,8 +287,13 @@ static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const FeedSta
     else { dr=ok_r; dg=ok_g; db=ok_b; }
     for (int a = 0; a < 8; a++) for (int b = 0; b < 8; b++)
       if ((a-4)*(a-4)+(b-4)*(b-4) <= 16) wput(back, W, H, STRIDE, lx+a, yy+2+b, dr, dg, db);
-    // name (bright) + next-run (dim) under it
-    wtext(back, W, H, STRIDE, lx + 14, yy, st->names[i], 2, cyan_r, cyan_g, cyan_b);
+    // name: RED for night-shift tasks (the recurring "Night shift" job + overnight one-shots),
+    // otherwise the normal cyan. Lets the queue signal at a glance which jobs run overnight.
+    int is_ns = ns_is_nightshift(st->names[i]);
+    float nr = is_ns ? err_r : cyan_r;
+    float ng = is_ns ? err_g : cyan_g;
+    float nb = is_ns ? err_b : cyan_b;
+    wtext(back, W, H, STRIDE, lx + 14, yy, st->names[i], 2, nr, ng, nb);
     wtext(back, W, H, STRIDE, lx + 14, yy + 18, st->when[i], 1, dim_r, dim_g, dim_b);
   }
   // scroll affordance: little up/down chevrons if more jobs exist off-screen
@@ -301,16 +325,30 @@ static void wfill(uint16_t *back, int W, int H, int STRIDE, int x, int y, int w,
 #define NS_JOB_NAME  "Night shift"
 #define NS_JOB_ID    "b7a26b64f480"
 #define NS_OUT_DIR   "/home/humdan/.hermes/cron/output/" NS_JOB_ID
-// RUN NOW button: bottom-right inside the panel. Bounds derived from OVL_* so the
-// tap handler in iris_fb.c can hit-test the exact same rectangle.
+// RUN NOW button: bottom-right inside the SMALL (tap-to-inspect) panel. Bounds
+// derived from OVL_* so the tap handler in iris_fb.c can hit-test the same rect.
 #define NS_BTN_W 120
 #define NS_BTN_H 34
 #define NS_BTN_X (OVL_X + OVL_W - NS_BTN_W - 12)
 #define NS_BTN_Y (OVL_Y + OVL_H - NS_BTN_H - 12)
 
+// LARGE night-shift console: dominates the screen so the live step log is the
+// focus while the shift runs. Spans the area right of the queue column, below
+// the clock, above the agent panel. 800x480 screen.
+#define NSC_X 288
+#define NSC_Y 66
+#define NSC_W 504
+#define NSC_H 366
+// RUN NOW button inside the big console (bottom-right).
+#define NSC_BTN_W 130
+#define NSC_BTN_H 38
+#define NSC_BTN_X (NSC_X + NSC_W - NSC_BTN_W - 14)
+#define NSC_BTN_Y (NSC_Y + NSC_H - NSC_BTN_H - 14)
+
 // Transcript cache: filled by ns_read_transcript() at ~1Hz, drawn every frame.
-#define NS_MAX_LINES 12
-#define NS_LINE_LEN  60
+// Sized to fill the large night-shift console panel (majority of the screen).
+#define NS_MAX_LINES 34
+#define NS_LINE_LEN  76
 typedef struct {
   char   lines[NS_MAX_LINES][NS_LINE_LEN];
   int    nlines;
@@ -356,11 +394,48 @@ static int ns_running_check(void) {
   return (time(NULL) - sb.st_mtime) < NS_RUNNING_FRESH_S;
 }
 
-// Cheap, bounded, non-blocking-ish read: open newest run file, seek to the last
-// '## Response' section, keep the LAST NS_MAX_LINES non-empty lines (truncated to
-// NS_LINE_LEN). Meant to be called ~1Hz off the render cadence, not per frame.
+// Cheap, bounded, non-blocking-ish read: prefer the LIVE step log written by
+// the iris plugin during a night-shift run (tool-by-tool progress); fall back to
+// the newest run's final report if no live log exists. Meant to be called ~1Hz
+// off the render cadence, not per frame.
+#define NS_LIVE_LOG "/tmp/iris_ns_live.log"
 static void ns_read_transcript(NightConsole *nc) {
   nc->have = 0; nc->nlines = 0; nc->running = 0; nc->mtime = 0;
+
+  // 1) Live step log: if present, it's the real-time trace — always prefer it.
+  struct stat lsb;
+  if (stat(NS_LIVE_LOG, &lsb) == 0 && lsb.st_size > 0) {
+    FILE *lf = fopen(NS_LIVE_LOG, "r");
+    if (lf) {
+      nc->have = 1;
+      nc->mtime = lsb.st_mtime;
+      nc->running = (time(NULL) - lsb.st_mtime) < NS_RUNNING_FRESH_S;
+      char ring[NS_MAX_LINES][NS_LINE_LEN];
+      int rn = 0, rhead = 0;
+      char raw[1024];
+      while (fgets(raw, sizeof(raw), lf)) {
+        size_t l = strlen(raw);
+        while (l > 0 && (raw[l-1] == '\n' || raw[l-1] == '\r')) raw[--l] = 0;
+        if (raw[0] == 0) continue;
+        char *slot = ring[rhead];
+        int i = 0;
+        for (const char *p = raw; *p && i < NS_LINE_LEN - 1; p++) {
+          char c = *p; if (c == '\t') c = ' '; slot[i++] = c;
+        }
+        slot[i] = 0;
+        rhead = (rhead + 1) % NS_MAX_LINES;
+        if (rn < NS_MAX_LINES) rn++;
+      }
+      fclose(lf);
+      int start = (rhead - rn + NS_MAX_LINES) % NS_MAX_LINES;
+      for (int k = 0; k < rn; k++)
+        memcpy(nc->lines[k], ring[(start + k) % NS_MAX_LINES], NS_LINE_LEN);
+      nc->nlines = rn;
+      return;
+    }
+  }
+
+  // 2) Fall back to the newest final report's "## Response" tail.
   char path[512];
   if (!ns_newest_file(path, sizeof(path))) return;
   struct stat sb;
@@ -409,29 +484,31 @@ static void ns_read_transcript(NightConsole *nc) {
   nc->nlines = rn;
 }
 
-// Draw the Night shift CONSOLE overlay: transcript tail + status line + RUN NOW.
+// Draw the Night shift CONSOLE overlay: a LARGE panel dominating the screen with
+// the live step log as the focus, plus a status line and RUN NOW button.
 // `firing_active` = 1 while showing the brief FIRING feedback after a tap.
 static void draw_night_console(uint16_t *back, int W, int H, int STRIDE,
                                const FeedStats *st, int sel,
                                const NightConsole *nc, int firing_active) {
   const float cyan_r = 0.35f, cyan_g = 0.75f, cyan_b = 0.95f;
   const float dim_r = 0.55f, dim_g = 0.60f, dim_b = 0.68f;
+  const float log_r = 0.55f, log_g = 0.85f, log_b = 0.70f;   // live-log green tint
   const float ok_r = 0.25f, ok_g = 0.85f, ok_b = 0.45f;
 
-  // panel background + border (same style as the plain detail overlay)
-  wfill(back, W, H, STRIDE, OVL_X, OVL_Y, OVL_W, OVL_H, 0.04f, 0.07f, 0.10f);
-  for (int x = 0; x < OVL_W; x++) {
-    if (x < 6 || x > OVL_W - 7) continue;
-    wput(back, W, H, STRIDE, OVL_X + x, OVL_Y, cyan_r, cyan_g, cyan_b);
-    wput(back, W, H, STRIDE, OVL_X + x, OVL_Y + OVL_H - 1, cyan_r, cyan_g, cyan_b);
+  // large panel background + border
+  wfill(back, W, H, STRIDE, NSC_X, NSC_Y, NSC_W, NSC_H, 0.03f, 0.06f, 0.09f);
+  for (int x = 0; x < NSC_W; x++) {
+    if (x < 6 || x > NSC_W - 7) continue;
+    wput(back, W, H, STRIDE, NSC_X + x, NSC_Y, cyan_r, cyan_g, cyan_b);
+    wput(back, W, H, STRIDE, NSC_X + x, NSC_Y + NSC_H - 1, cyan_r, cyan_g, cyan_b);
   }
-  for (int y = 0; y < OVL_H; y++) {
-    if (y < 6 || y > OVL_H - 7) continue;
-    wput(back, W, H, STRIDE, OVL_X, OVL_Y + y, cyan_r, cyan_g, cyan_b);
-    wput(back, W, H, STRIDE, OVL_X + OVL_W - 1, OVL_Y + y, cyan_r, cyan_g, cyan_b);
+  for (int y = 0; y < NSC_H; y++) {
+    if (y < 6 || y > NSC_H - 7) continue;
+    wput(back, W, H, STRIDE, NSC_X, NSC_Y + y, cyan_r, cyan_g, cyan_b);
+    wput(back, W, H, STRIDE, NSC_X + NSC_W - 1, NSC_Y + y, cyan_r, cyan_g, cyan_b);
   }
 
-  int px = OVL_X + 16, py = OVL_Y + 12;
+  int px = NSC_X + 16, py = NSC_Y + 12;
   // title
   wtext(back, W, H, STRIDE, px, py, st->names[sel], 2, cyan_r, cyan_g, cyan_b);
 
@@ -453,44 +530,51 @@ static void draw_night_console(uint16_t *back, int W, int H, int STRIDE,
     wtext(back, W, H, STRIDE, px + 12 * 6 * 2, py + 2, sbuf, 1, sr, sg, sb);
   }
 
-  // transcript area (small font, one line per row)
-  int ty = py + 26;
+  // "LIVE LOG" header + separator; the log itself gets the rest of the panel.
+  int cy = py + 26;
+  wtext(back, W, H, STRIDE, px, cy, "LIVE LOG", 1, cyan_r, cyan_g, cyan_b);
+  cy += 14;
+  for (int x = px; x < NSC_X + NSC_W - 16; x++) wput(back, W, H, STRIDE, x, cy, 0.14f, 0.18f, 0.22f);
+  cy += 6;
+
+  // transcript area — the live step log tail; fills down to the button row.
+  int ty = cy;
   int line_h = 11;   // scale-1 glyph is 7px tall + gap
   if (!nc->have || nc->nlines == 0) {
-    wtext(back, W, H, STRIDE, px, ty, nc->have ? "(EMPTY RESPONSE)" : "NO RUNS YET",
+    wtext(back, W, H, STRIDE, px, ty, nc->have ? "(NO STEPS YET)" : "NO RUNS YET",
           1, dim_r, dim_g, dim_b);
   } else {
     // how many lines fit above the button row
-    int avail = (NS_BTN_Y - 6 - ty) / line_h;
+    int avail = (NSC_BTN_Y - 8 - ty) / line_h;
     if (avail > nc->nlines) avail = nc->nlines;
     if (avail > NS_MAX_LINES) avail = NS_MAX_LINES;
     int first = nc->nlines - avail; if (first < 0) first = 0;
     for (int k = 0; k < avail; k++) {
       wtext(back, W, H, STRIDE, px, ty + k * line_h, nc->lines[first + k], 1,
-            dim_r, dim_g, dim_b);
+            log_r, log_g, log_b);
     }
   }
 
-  // RUN NOW button (bottom-right), bordered rectangle
+  // RUN NOW button (bottom-right of the big console), bordered rectangle
   {
     float br = firing_active ? 0.95f : cyan_r;
     float bg = firing_active ? 0.75f : cyan_g;
     float bb = firing_active ? 0.20f : cyan_b;
     // fill
-    wfill(back, W, H, STRIDE, NS_BTN_X, NS_BTN_Y, NS_BTN_W, NS_BTN_H,
+    wfill(back, W, H, STRIDE, NSC_BTN_X, NSC_BTN_Y, NSC_BTN_W, NSC_BTN_H,
           0.08f, 0.12f, 0.16f);
     // border
-    for (int x = 0; x < NS_BTN_W; x++) {
-      wput(back, W, H, STRIDE, NS_BTN_X + x, NS_BTN_Y, br, bg, bb);
-      wput(back, W, H, STRIDE, NS_BTN_X + x, NS_BTN_Y + NS_BTN_H - 1, br, bg, bb);
+    for (int x = 0; x < NSC_BTN_W; x++) {
+      wput(back, W, H, STRIDE, NSC_BTN_X + x, NSC_BTN_Y, br, bg, bb);
+      wput(back, W, H, STRIDE, NSC_BTN_X + x, NSC_BTN_Y + NSC_BTN_H - 1, br, bg, bb);
     }
-    for (int y = 0; y < NS_BTN_H; y++) {
-      wput(back, W, H, STRIDE, NS_BTN_X, NS_BTN_Y + y, br, bg, bb);
-      wput(back, W, H, STRIDE, NS_BTN_X + NS_BTN_W - 1, NS_BTN_Y + y, br, bg, bb);
+    for (int y = 0; y < NSC_BTN_H; y++) {
+      wput(back, W, H, STRIDE, NSC_BTN_X, NSC_BTN_Y + y, br, bg, bb);
+      wput(back, W, H, STRIDE, NSC_BTN_X + NSC_BTN_W - 1, NSC_BTN_Y + y, br, bg, bb);
     }
     const char *label = firing_active ? "FIRING" : "RUN NOW";
     int lw = (int)strlen(label) * 6 * 2;
-    wtext(back, W, H, STRIDE, NS_BTN_X + (NS_BTN_W - lw) / 2, NS_BTN_Y + 10,
+    wtext(back, W, H, STRIDE, NSC_BTN_X + (NSC_BTN_W - lw) / 2, NSC_BTN_Y + 12,
           label, 2, br, bg, bb);
   }
 }
@@ -523,12 +607,12 @@ static void ns_tint_red(uint16_t *back, int W, int H, int STRIDE, float pulse) {
 // Full-width top banner: a stronger red bar with centered white label. Sits at the
 // very top strip; `pulse` (0..1) gently modulates the bar brightness so it reads live.
 #define NS_BANNER_H 32
-static void draw_night_banner(uint16_t *back, int W, int H, int STRIDE, float pulse) {
+static void draw_night_banner(uint16_t *back, int W, int H, int STRIDE, float pulse, const char *label) {
   float br = 0.55f + 0.20f * pulse;   // bar red
   wfill(back, W, H, STRIDE, 0, 0, W, NS_BANNER_H, br, 0.05f, 0.06f);
   // thin bright underline for definition
   wfill(back, W, H, STRIDE, 0, NS_BANNER_H - 2, W, 2, 0.95f, 0.35f, 0.35f);
-  const char *label = "NIGHT SHIFT RUNNING";
+  if (!label) label = "NIGHT SHIFT RUNNING";
   int scale = 3;
   int tw = (int)strlen(label) * 6 * scale;   // wtext advance = 6px/char * scale
   int tx = (W - tw) / 2;
@@ -596,6 +680,7 @@ typedef struct {
   int active_agents;     // subagents currently working
   int last_active_s;     // seconds since gateway updated_at
   char version[16];      // hermes code_version
+  char task_label[24];   // current tool/task from /tmp/iris_task (e.g., SHELL, SEARCH, BROWSER, CODE, EDIT)
 } AgentStats;
 
 // Extract a "key":value from a small JSON blob without a parser.
@@ -635,6 +720,22 @@ static void read_agent_stats(AgentStats *a) {
     fclose(f);
   }
 
+  // current task label from /tmp/iris_task (refreshed ~1Hz from Hermes plugin)
+  f = fopen("/tmp/iris_task", "r");
+  if (f) {
+    char buf[32] = {0};
+    if (fgets(buf, sizeof(buf) - 1, f)) {
+      // strip newline
+      char *n = strchr(buf, '\n');
+      if (n) *n = 0;
+      strncpy(a->task_label, buf, sizeof(a->task_label) - 1);
+      a->task_label[sizeof(a->task_label) - 1] = 0;
+    }
+    fclose(f);
+  } else {
+    a->task_label[0] = 0;
+  }
+
   // gateway_state.json — read whole small file
   f = fopen("/home/humdan/.hermes/gateway_state.json", "r");
   if (f) {
@@ -658,7 +759,7 @@ static void read_agent_stats(AgentStats *a) {
 }
 
 // Bottom full-width agent panel.
-static void draw_agent_panel(uint16_t *back, int W, int H, int STRIDE, const AgentStats *a) {
+static void draw_agent_panel(uint16_t *back, int W, int H, int STRIDE, const AgentStats *a, int ns_manual) {
   const float cyan_r = 0.35f, cyan_g = 0.75f, cyan_b = 0.95f;
   const float dim_r = 0.40f, dim_g = 0.45f, dim_b = 0.52f;
   const float ok_r = 0.25f, ok_g = 0.85f, ok_b = 0.45f;
@@ -690,11 +791,27 @@ static void draw_agent_panel(uint16_t *back, int W, int H, int STRIDE, const Age
   wtext(back, W, H, STRIDE, gx + 16, y + 22, a->telegram_ok ? "TELEGRAM OK" : "TG DOWN", 1,
         a->telegram_ok ? ok_r : bad_r, a->telegram_ok ? ok_g : bad_g, a->telegram_ok ? ok_b : bad_b);
 
-  // AGENTS working
+  // AGENTS / TASK TAG (right column): task label (cyan) when active; else agents or IDLE
   int ax = 500;
-  snprintf(buf, sizeof(buf), "AGENTS %d", a->active_agents);
-  wtext(back, W, H, STRIDE, ax, y, buf, 2,
-        a->active_agents > 0 ? cyan_r : dim_r, a->active_agents > 0 ? cyan_g : dim_g, a->active_agents > 0 ? cyan_b : dim_b);
+  if (a->task_label[0]) {
+    snprintf(buf, sizeof(buf), "%s", a->task_label);
+    wtext(back, W, H, STRIDE, ax, y, buf, 2, cyan_r, cyan_g, cyan_b);
+    wtext(back, W, H, STRIDE, ax, y + 24, "WORKING", 1, dim_r, dim_g, dim_b);
+  } else {
+    snprintf(buf, sizeof(buf), "AGENTS %d", a->active_agents);
+    wtext(back, W, H, STRIDE, ax, y, buf, 2,
+          a->active_agents > 0 ? cyan_r : dim_r, a->active_agents > 0 ? cyan_g : dim_g, a->active_agents > 0 ? cyan_b : dim_b);
+    // If truly idle (no agents, no thinking), show IDLE as sub-label in dim
+    const char *sub = (a->active_agents == 0 && !a->thinking) ? "IDLE" : "";
+    wtext(back, W, H, STRIDE, ax, y + 24, sub, 1, dim_r, dim_g, dim_b);
+  }
+
+  // NIGHT MODE pill (manual toggle) - visible pill in agent panel, tappable zone below it
+  int npill_x = 460, npill_y = H - 38;
+  int npill_w = 72, npill_h = 18;
+  float np_r = ns_manual ? 0.95f : 0.3f, np_g = 0.15f, np_b = 0.15f;
+  wfill(back, W, H, STRIDE, npill_x, npill_y, npill_w, npill_h, np_r, np_g, np_b);
+  wtext(back, W, H, STRIDE, npill_x + 6, npill_y + 3, ns_manual ? "NIGHT ON" : "NIGHT OFF", 1, 0.95f, 0.95f, 0.95f);
 
   // LAST ACTIVE
   int ls = a->last_active_s;

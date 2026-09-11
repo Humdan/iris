@@ -44,6 +44,28 @@ static void ns_fire_job(void) {
     // parent returns immediately; SIG_IGN on SIGCHLD reaps the child.
 }
 
+// Set the BLE LED by exec'ing a wrapper script in a detached child (same
+// fork+exec pattern as ns_fire_job — NEVER blocks the 60Hz render loop; the
+// BLE write can take a couple seconds and that's fine in the child).
+static void led_set(const char *script) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
+        execl("/bin/bash", "bash", script, (char *)NULL);
+        _exit(127);
+    }
+}
+
+// Manual night-shift toggle pill geometry (bottom agent panel).
+// MUST match the visible pill drawn in draw_agent_panel() (iris_widgets.h):
+//   pill at (460, H-38) size 72x18. The tap zone is padded ~10px around it so
+//   a fingertip reliably lands. Keep these in sync with NS_PILL_* in the header.
+#define NS_TOGGLE_X 450
+#define NS_TOGGLE_Y (H - 48)
+#define NS_TOGGLE_W 92
+#define NS_TOGGLE_H 38
+
 static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec * 1e-9; }
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
 static float frand(void) { return rand() / (float)RAND_MAX; }
@@ -270,10 +292,12 @@ int main(int argc, char **argv) {
 
     // Night shift CONSOLE state: transcript cache refreshed ~1Hz, plus a brief
     // FIRING feedback timestamp set when the RUN NOW button is tapped.
-    NightConsole ns_con; memset(&ns_con, 0, sizeof(ns_con));
-    double ns_last_read = 0;     // last transcript read (monotonic)
-    double ns_fire_at   = -1e9;  // time RUN NOW was tapped; FIRING shows for ~2.5s
-    int    ns_running   = 0;     // night shift actively running (fresh transcript mtime)
+        NightConsole ns_con; memset(&ns_con, 0, sizeof(ns_con));
+        double ns_last_read = 0;     // last transcript read (monotonic)
+        double ns_fire_at   = -1e9;  // time RUN NOW was tapped; FIRING shows for ~2.5s
+        int    ns_running   = 0;     // night shift actively running (fresh transcript mtime)
+        int    ns_manual    = 0;     // manual night shift mode toggle (0=off, 1=on)
+        int    ns_manual_prev = 0;   // previous manual state for edge-triggered LED
 
     // per-gesture bookkeeping tracked across frames
     int   last_seq_down = 0, last_seq_up = 0;
@@ -352,17 +376,40 @@ int main(int argc, char **argv) {
             if (mv < 15) {
                 // TAP — hit-test against queue rows / overlay / elsewhere
                 int handled = 0;
-                if (sel_job >= 0 &&
+                // Is the large Night shift console currently on screen? It shows
+                // when night mode is active (manual/running) OR the Night shift
+                // job row is selected. RUN NOW lives inside that big panel.
+                int ns_console_showing = ns_manual || ns_running ||
+                    (sel_job >= 0 && strcmp(stats.names[sel_job], NS_JOB_NAME) == 0);
+                if (ns_console_showing &&
+                    upx >= NSC_BTN_X && upx < NSC_BTN_X + NSC_BTN_W &&
+                    upy >= NSC_BTN_Y && upy < NSC_BTN_Y + NSC_BTN_H) {
+                    ns_fire_job();          // fork+exec detached; returns instantly
+                    ns_fire_at = t;         // show FIRING feedback briefly
+                    handled = 1;
+                } else if (ns_console_showing &&
+                    upx >= NSC_X && upx < NSC_X + NSC_W &&
+                    upy >= NSC_Y && upy < NSC_Y + NSC_H) {
+                    handled = 1;   // tap inside the console panel: keep it open
+                } else if (sel_job >= 0 &&
                     upx >= OVL_X && upx < OVL_X + OVL_W &&
                     upy >= OVL_Y && upy < OVL_Y + OVL_H) {
-                    handled = 1;   // tap inside the overlay: keep it open
-                    // Night shift console: RUN NOW button fires the cron job.
-                    if (strcmp(stats.names[sel_job], NS_JOB_NAME) == 0 &&
-                        upx >= NS_BTN_X && upx < NS_BTN_X + NS_BTN_W &&
-                        upy >= NS_BTN_Y && upy < NS_BTN_Y + NS_BTN_H) {
-                        ns_fire_job();          // fork+exec detached; returns instantly
-                        ns_fire_at = t;         // show FIRING feedback briefly
+                    handled = 1;   // tap inside the small job-detail overlay: keep open
+                }
+                // MANUAL NIGHT SHIFT TOGGLE: reachable on the normal screen (not
+                // gated behind an open overlay). Small pill in the bottom agent panel.
+                if (!handled && upx >= NS_TOGGLE_X && upx < NS_TOGGLE_X + NS_TOGGLE_W &&
+                    upy >= NS_TOGGLE_Y && upy < NS_TOGGLE_Y + NS_TOGGLE_H) {
+                    ns_manual = !ns_manual;
+                    // Edge-triggered LED: red when mode goes ON, green when it goes
+                    // OFF (only if the real job isn't also running).
+                    if (ns_manual) {
+                        led_set("/home/humdan/.hermes/scripts/led-red.sh");
+                    } else if (!ns_running) {
+                        led_set("/home/humdan/.hermes/scripts/led-green-bright.sh");
                     }
+                    ns_manual_prev = ns_manual;
+                    handled = 1;
                 }
                 if (!handled && upx < QUEUE_PANEL_W && upy >= QUEUE_LY - 6) {
                     int row = (upy - QUEUE_LY) / QUEUE_ROW_H;
@@ -482,10 +529,15 @@ int main(int argc, char **argv) {
             float bright = (0.62f + 0.38f * act) * tw * depth;
             float rad = 1.6f + 1.0f * act + 0.8f * depth;
 
-            // cyan idle -> slightly warmer (more green/white) when active
-            float rr = bright * (0.05f + 0.35f * act);
-            float gg = bright * (0.70f + 0.25f * act);
-            float bb = bright * (0.90f);
+            // hue shift: cyan (idle) -> warm amber/gold (active), eased with act
+            // cyan base:  (0.05, 0.45, 0.95)
+            // amber target: (1.00, 0.55, 0.10)
+            float base_r = 0.05f + 0.95f * act;
+            float base_g = 0.45f + 0.10f * act;
+            float base_b = 0.95f - 0.80f * act;
+            float rr = bright * base_r;
+            float gg = bright * base_g;
+            float bb = bright * base_b;
             dot_16(back, W, H, STRIDE, px, py, rad, rr, gg, bb);
         }
 
@@ -519,25 +571,41 @@ int main(int argc, char **argv) {
         // --- widgets: clock + system stats + agent panel on top of the orb ---
         if (t - tstats > 1.0) { tstats = t; read_stats(&stats); read_agent_stats(&agent); ns_running = ns_running_check(); }
         if (sel_job >= stats.njobs) sel_job = -1;   // job vanished from queue
-        // Refresh the Night shift transcript ~1Hz (only while its console is open).
-        int ns_open = (sel_job >= 0 && strcmp(stats.names[sel_job], NS_JOB_NAME) == 0);
+
+        // Locate the Night shift job in the current queue (index or -1).
+        int ns_job_idx = -1;
+        for (int i = 0; i < stats.njobs; i++)
+            if (strcmp(stats.names[i], NS_JOB_NAME) == 0) { ns_job_idx = i; break; }
+
+        // Night-shift mode active (manual toggle OR a real run detected) forces the
+        // live console open so the transcript is always visible while it works.
+        int ns_mode = (ns_manual || ns_running);
+        // The console is shown when the user tapped the job row, OR whenever
+        // night-shift mode is active and we know which row is the Night shift job.
+        int ns_open = (sel_job >= 0 && strcmp(stats.names[sel_job], NS_JOB_NAME) == 0)
+                      || (ns_mode && ns_job_idx >= 0);
+        // Which job index the console should render for.
+        int ns_console_job = (sel_job >= 0 && strcmp(stats.names[sel_job], NS_JOB_NAME) == 0)
+                             ? sel_job : ns_job_idx;
+
+        // Refresh the Night shift transcript ~1Hz whenever its console is open.
         if (ns_open && t - ns_last_read > 1.0) { ns_last_read = t; ns_read_transcript(&ns_con); }
         draw_widgets(back, W, H, STRIDE, &stats, (int)(scroll_f + 0.5f), sel_job);
-        draw_agent_panel(back, W, H, STRIDE, &agent);
-        if (sel_job >= 0) {
-            if (ns_open) {
-                int firing = (t - ns_fire_at) < 2.5;   // brief RUN NOW feedback
-                draw_night_console(back, W, H, STRIDE, &stats, sel_job, &ns_con, firing);
-            } else {
-                draw_job_detail(back, W, H, STRIDE, &stats, sel_job);
-            }
+        draw_agent_panel(back, W, H, STRIDE, &agent, ns_manual);
+        if (ns_open && ns_console_job >= 0) {
+            int firing = (t - ns_fire_at) < 2.5;   // brief RUN NOW feedback
+            draw_night_console(back, W, H, STRIDE, &stats, ns_console_job, &ns_con, firing);
+        } else if (sel_job >= 0) {
+            draw_job_detail(back, W, H, STRIDE, &stats, sel_job);
         }
 
-        // --- Night shift RUNNING ambient layer (additive; only while running) ---
-        if (ns_running) {
+        // --- Night shift RUNNING/MANUAL ambient layer (additive; while running OR manual) ---
+        if (ns_mode) {
             float pulse = 0.5f + 0.5f * sinf(global_time * 2.0f * (float)M_PI * 0.5f); // ~0.5Hz
             ns_tint_red(back, W, H, STRIDE, pulse);
-            draw_night_banner(back, W, H, STRIDE, pulse);
+            // Manual toggle shows a distinct label; the real cron job shows RUNNING.
+            const char *label = ns_manual ? "NIGHT SHIFT (MANUAL)" : "NIGHT SHIFT RUNNING";
+            draw_night_banner(back, W, H, STRIDE, pulse, label);
         }
 
         // --- blit atomically ---
