@@ -381,12 +381,22 @@ static int ns_newest_file(char *out, int outsz) {
   return 1;
 }
 
-// Lightweight running-state probe: stat() ONLY the newest *.md in the output dir
-// (no file open/read) and report whether its mtime is within the last ~25s. The
-// agent appends to that transcript as it works, so a fresh mtime == actively
-// running. Meant to be called ~1Hz off the render cadence, never per frame.
+// Live step log written by the iris plugin during a night-shift run. Its mtime
+// is the truest "is it running now?" signal: it updates at session start and on
+// every tool call, whereas the final *.md report is only written when the run
+// ENDS. So both the running-state probe and the transcript reader key off it.
+#define NS_LIVE_LOG "/tmp/iris_ns_live.log"
+
+// Lightweight running-state probe: a night-shift run is "live" when the live
+// step log was touched within the last ~25s (session start + each tool call
+// bump it). Falls back to the newest *.md mtime so a run that wrote its report
+// but no live log (e.g. plugin disabled) still briefly registers. Meant to be
+// called ~1Hz off the render cadence, never per frame.
 #define NS_RUNNING_FRESH_S 25
 static int ns_running_check(void) {
+  struct stat lsb;
+  if (stat(NS_LIVE_LOG, &lsb) == 0 && lsb.st_size > 0)
+    if ((time(NULL) - lsb.st_mtime) < NS_RUNNING_FRESH_S) return 1;
   char path[512];
   if (!ns_newest_file(path, sizeof(path))) return 0;
   struct stat sb;
@@ -398,7 +408,6 @@ static int ns_running_check(void) {
 // the iris plugin during a night-shift run (tool-by-tool progress); fall back to
 // the newest run's final report if no live log exists. Meant to be called ~1Hz
 // off the render cadence, not per frame.
-#define NS_LIVE_LOG "/tmp/iris_ns_live.log"
 static void ns_read_transcript(NightConsole *nc) {
   nc->have = 0; nc->nlines = 0; nc->running = 0; nc->mtime = 0;
 

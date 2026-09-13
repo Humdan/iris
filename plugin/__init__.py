@@ -247,6 +247,9 @@ def _on_session_end(**_kw) -> None:
         _level = 0.0
     _write(0.0)
     _write_task("")
+    # Always leave a closing line so even a no-op / [SILENT] run shows it ran.
+    # Keep the mtime fresh for ~a few more seconds of "just finished" banner.
+    _live_append("night shift finished")
 
 
 def register(ctx) -> None:
