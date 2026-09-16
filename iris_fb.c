@@ -275,6 +275,7 @@ int main(int argc, char **argv) {
     float global_time = 0, spark_time = 0;
     FeedStats stats; read_stats(&stats);   // clock + tool-call feed, refreshed ~1 Hz below
     AgentStats agent; read_agent_stats(&agent);
+    PortfolioStats portfolio; read_portfolio_stats(&portfolio);
 
     // --- touch: spawn the reader thread; render loop only samples shared state ---
     pthread_t tid;
@@ -569,7 +570,7 @@ int main(int argc, char **argv) {
         }
 
         // --- widgets: clock + system stats + agent panel on top of the orb ---
-        if (t - tstats > 1.0) { tstats = t; read_stats(&stats); read_agent_stats(&agent); ns_running = ns_running_check(); }
+        if (t - tstats > 1.0) { tstats = t; read_stats(&stats); read_agent_stats(&agent); read_portfolio_stats(&portfolio); ns_running = ns_running_check(); }
         if (sel_job >= stats.njobs) sel_job = -1;   // job vanished from queue
 
         // Locate the Night shift job in the current queue (index or -1).
@@ -591,7 +592,7 @@ int main(int argc, char **argv) {
         // Refresh the Night shift transcript ~1Hz whenever its console is open.
         if (ns_open && t - ns_last_read > 1.0) { ns_last_read = t; ns_read_transcript(&ns_con); }
         draw_widgets(back, W, H, STRIDE, &stats, (int)(scroll_f + 0.5f), sel_job);
-        draw_agent_panel(back, W, H, STRIDE, &agent, ns_manual);
+        draw_agent_panel(back, W, H, STRIDE, &agent, ns_manual, &portfolio);
         if (ns_open && ns_console_job >= 0) {
             int firing = (t - ns_fire_at) < 2.5;   // brief RUN NOW feedback
             draw_night_console(back, W, H, STRIDE, &stats, ns_console_job, &ns_con, firing);

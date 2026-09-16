@@ -22,7 +22,9 @@ typedef struct { char c; uint8_t col[5]; } Glyph;
 static const Glyph FONT[] = {
   {' ',{0,0,0,0,0}},
   {'!',{0x00,0x00,0x5F,0x00,0x00}},
+  {'$',{0x24,0x54,0xFF,0x54,0x48}},
   {'%',{0x23,0x13,0x08,0x64,0x62}},
+  {'+',{0x08,0x08,0x3E,0x08,0x08}},
   {'.',{0x00,0x60,0x60,0x00,0x00}},
   {'/',{0x20,0x10,0x08,0x04,0x02}},
   {':',{0x00,0x36,0x36,0x00,0x00}},
@@ -767,8 +769,33 @@ static void read_agent_stats(AgentStats *a) {
   }
 }
 
+// Paper-portfolio snapshot, refreshed via a tiny cache file the C loop reads
+// cheaply (~1Hz, same cadence as AgentStats). The cache is written by a small
+// wrapper script (see scripts/portfolio-cache.sh) that shells ledger.py status
+// -- keeps the render loop free of subprocess spawns. Format (one line,
+// pipe-delimited, all it needs): "<total_value>|<pnl_pct>".
+typedef struct {
+  int have;         // 1 if cache file present and parsed
+  float total;       // total portfolio value in USD
+  float pnl_pct;      // % change since $1000 start
+} PortfolioStats;
+
+static void read_portfolio_stats(PortfolioStats *p) {
+  memset(p, 0, sizeof(*p));
+  FILE *f = fopen("/tmp/iris_portfolio", "r");
+  if (!f) return;
+  char buf[64] = {0};
+  if (fgets(buf, sizeof(buf) - 1, f)) {
+    float total = 0, pct = 0;
+    if (sscanf(buf, "%f|%f", &total, &pct) == 2) {
+      p->have = 1; p->total = total; p->pnl_pct = pct;
+    }
+  }
+  fclose(f);
+}
+
 // Bottom full-width agent panel.
-static void draw_agent_panel(uint16_t *back, int W, int H, int STRIDE, const AgentStats *a, int ns_manual) {
+static void draw_agent_panel(uint16_t *back, int W, int H, int STRIDE, const AgentStats *a, int ns_manual, const PortfolioStats *pf) {
   const float cyan_r = 0.35f, cyan_g = 0.75f, cyan_b = 0.95f;
   const float dim_r = 0.40f, dim_g = 0.45f, dim_b = 0.52f;
   const float ok_r = 0.25f, ok_g = 0.85f, ok_b = 0.45f;
@@ -813,6 +840,26 @@ static void draw_agent_panel(uint16_t *back, int W, int H, int STRIDE, const Age
     // If truly idle (no agents, no thinking), show IDLE as sub-label in dim
     const char *sub = (a->active_agents == 0 && !a->thinking) ? "IDLE" : "";
     wtext(back, W, H, STRIDE, ax, y + 24, sub, 1, dim_r, dim_g, dim_b);
+  }
+
+  // PORTFOLIO (paper-trading fund) — far right column, own space so it never
+  // collides with AGENTS/TASK. Green above $1000 start, red below, dim if
+  // the cache hasn't been written yet (script/ledger not running).
+  int px = 650;
+  if (pf->have) {
+    char pfbuf[24];
+    snprintf(pfbuf, sizeof(pfbuf), "$%d", (int)(pf->total + 0.5f));
+    float pr = pf->pnl_pct > 0 ? ok_r : pf->pnl_pct < 0 ? bad_r : dim_r;
+    float pg = pf->pnl_pct > 0 ? ok_g : pf->pnl_pct < 0 ? bad_g : dim_g;
+    float pb = pf->pnl_pct > 0 ? ok_b : pf->pnl_pct < 0 ? bad_b : dim_b;
+    wtext(back, W, H, STRIDE, px, y, pfbuf, 2, pr, pg, pb);
+    char pctbuf[16];
+    snprintf(pctbuf, sizeof(pctbuf), "%s%d.%d%%", pf->pnl_pct >= 0 ? "+" : "-",
+             abs((int)pf->pnl_pct), abs((int)(pf->pnl_pct * 10)) % 10);
+    wtext(back, W, H, STRIDE, px, y + 24, pctbuf, 1, pr, pg, pb);
+  } else {
+    wtext(back, W, H, STRIDE, px, y, "PORTFOLIO", 1, dim_r, dim_g, dim_b);
+    wtext(back, W, H, STRIDE, px, y + 24, "NO DATA", 1, dim_r, dim_g, dim_b);
   }
 
   // NIGHT MODE pill (manual toggle) - visible pill in agent panel, tappable zone below it
