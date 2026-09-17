@@ -33,6 +33,31 @@ echo "thinking" > /tmp/iris_state
 echo "idle" > /tmp/iris_state
 ```
 
+## Session Orbs — one marble per open Hermes session
+
+`session_watcher.py` polls `~/.hermes/state.db` every 2 seconds and writes the
+currently open sessions to `/tmp/iris_sessions.json`. Iris renders one orb for
+each open session:
+
+- **Most recent / active session** — bigger, brighter, and in a distinct color
+  (magenta for Telegram, amber for cron, cyan for CLI). It pulses and orbits
+  slightly faster so your eye goes straight to it.
+- **Other open sessions** — smaller, dimmer orbs in their source color, orbiting
+  more slowly.
+- **Status line** — shows the live session count in both idle and thinking modes.
+
+```bash
+# Run the watcher (or let the systemd service do it)
+python3 session_watcher.py --watch --interval 2
+
+# Override the data path if you want to test with your own JSON
+export IRIS_SESSIONS_FILE=/path/to/sessions.json
+```
+
+Orbs are overlaid on top of the idle and thinking animations, so they stay
+visible regardless of the activity state. If the watcher file is missing or
+unreadable, Iris silently falls back to no orbs.
+
 ## Pi LCD / boot service
 
 `iris_fb.c` is a smooth per-pixel renderer for the framebuffer (`/dev/fb0`):
@@ -90,14 +115,16 @@ The animation has two primary states:
 iris/
 ├── README.md
 ├── requirements.txt
-├── iris.py              # Main entry point
-├── animation_engine.py  # Core animation logic
+├── iris.py                 # Main entry point
+├── animation_engine.py     # Core animation logic
+├── session_watcher.py      # Polls Hermes DB, emits /tmp/iris_sessions.json
 ├── states/
-│   ├── thinking.py      # Thinking mode animations
-│   └── idle.py          # Idle mode animations
+│   ├── thinking.py         # Thinking mode animations + session orbs
+│   └── idle.py             # Idle mode animations + session orbs
 └── utils/
-    ├── terminal.py      # Terminal control utilities
-    └── patterns.py      # Shared animation patterns
+    ├── terminal.py         # Terminal control utilities
+    ├── patterns.py         # Shared animation patterns
+    └── framebuffer.py      # Framebuffer color palette
 ```
 
 ## License

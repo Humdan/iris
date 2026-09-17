@@ -73,6 +73,8 @@ static const uint8_t *glyph_for(char ch) {
   return FONT[0].col; // space
 }
 
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+
 // Draw one RGB565 pixel with additive-ish set (opaque) into back buffer.
 static inline void wput(uint16_t *back, int W, int H, int STRIDE, int x, int y,
                         float r, float g, float b) {
@@ -696,13 +698,20 @@ typedef struct {
 
 // Extract a "key":value from a small JSON blob without a parser.
 // Returns pointer just after the ':' for `key`, or NULL.
-static const char *json_find(const char *buf, const char *key) {
+// If `end` is non-NULL, stops searching at that position.
+static const char *json_find(const char *buf, const char *key, const char *end) {
   char pat[64];
   snprintf(pat, sizeof(pat), "\"%s\"", key);
   const char *p = strstr(buf, pat);
   if (!p) return NULL;
+  if (end && p >= end) return NULL;
   p = strchr(p + strlen(pat), ':');
   return p ? p + 1 : NULL;
+}
+
+// Overload for simple case without end bound
+static const char *json_find2(const char *buf, const char *key) {
+  return json_find(buf, key, NULL);
 }
 
 // Parse an ISO8601 UTC timestamp ("2026-09-08T01:14:41...") to epoch seconds.
@@ -753,23 +762,23 @@ static void read_agent_stats(AgentStats *a) {
     char buf[4096]; size_t n = fread(buf, 1, sizeof(buf) - 1, f); buf[n] = 0;
     fclose(f);
     const char *p;
-    if ((p = json_find(buf, "gateway_state"))) a->gateway_up = (strstr(p, "running") && strstr(p, "running") < p + 20);
+    if ((p = json_find2(buf, "gateway_state"))) a->gateway_up = (strstr(p, "running") && strstr(p, "running") < p + 20);
     // telegram connected?
     const char *tg = strstr(buf, "\"telegram\"");
-    if (tg && (p = json_find(tg, "state"))) a->telegram_ok = (strstr(p, "connected") && strstr(p, "connected") < p + 20);
-    if ((p = json_find(buf, "active_agents"))) a->active_agents = atoi(p);
-    if ((p = json_find(buf, "code_version"))) {
+    if (tg && (p = json_find2(tg, "state"))) a->telegram_ok = (strstr(p, "connected") && strstr(p, "connected") < p + 20);
+    if ((p = json_find2(buf, "active_agents"))) a->active_agents = atoi(p);
+    if ((p = json_find2(buf, "code_version"))) {
       const char *q = strchr(p, '"');
       if (q) { q++; int i = 0; while (*q && *q != '"' && i < 15) a->version[i++] = *q++; a->version[i] = 0; }
     }
-    if ((p = json_find(buf, "updated_at"))) {
+    if ((p = json_find2(buf, "updated_at"))) {
       const char *q = strchr(p, '"');
       if (q) { time_t up = parse_iso_utc(q + 1); if (up) { time_t d = time(NULL) - up; a->last_active_s = d < 0 ? 0 : (int)d; } }
     }
   }
 }
 
-// Paper-portfolio snapshot, refreshed via a tiny cache file the C loop reads
+// ---- Paper-portfolio snapshot, refreshed via a tiny cache file the C loop reads
 // cheaply (~1Hz, same cadence as AgentStats). The cache is written by a small
 // wrapper script (see scripts/portfolio-cache.sh) that shells ledger.py status
 // -- keeps the render loop free of subprocess spawns. Format (one line,
@@ -779,6 +788,346 @@ typedef struct {
   float total;       // total portfolio value in USD
   float pnl_pct;      // % change since $1000 start
 } PortfolioStats;
+
+
+// ---- Session orbs: one orb per open Hermes session ----
+#define SESSION_MAX 32
+#define SESSION_FILE "/tmp/iris_sessions.json"
+
+typedef struct {
+  char label[24];
+  char short_label[8];   // abbreviated for display (up to 7 chars + null)
+  char source[16];       // "cli", "telegram", "cron"
+  char color[16];        // "cyan", "magenta", "amber"
+  int is_primary;        // 1 for most recent session
+  float idle_seconds;
+  float orbit_angle;     // current orbital angle for smooth motion
+  float orbit_radius;    // distance from center
+  float pulse_phase;     // individual pulse phase
+} SessionOrb;
+
+typedef struct {
+  int count;
+  SessionOrb orbs[SESSION_MAX];
+  time_t last_read;
+} SessionStats;
+
+static void read_session_stats(SessionStats *s) {
+  // Only re-read every ~2 seconds
+  time_t now = time(NULL);
+  if (s->count > 0 && now - s->last_read < 2) return;
+
+  FILE *f = fopen(SESSION_FILE, "r");
+  if (!f) { s->count = 0; return; }
+
+  static char buf[8192];
+  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+  buf[n] = 0;
+  fclose(f);
+
+  // Simple JSON parsing for the sessions array
+  const char *p = strstr(buf, "\"sessions\"");
+  if (!p) { s->count = 0; return; }
+  p = strchr(p, '[');
+  if (!p) { s->count = 0; return; }
+
+  s->count = 0;
+  p++; // skip '['
+  while (*p && s->count < SESSION_MAX) {
+    // Find next object
+    while (*p && *p != '{') p++;
+    if (!*p) break;
+    const char *obj_start = p;
+    int brace = 0;
+    while (*p) {
+      if (*p == '{') brace++;
+      else if (*p == '}') {
+        brace--;
+        if (brace == 0) { p++; break; }
+      }
+      p++;
+    }
+    const char *obj_end = p;
+
+    // Parse this object
+    SessionOrb *orb = &s->orbs[s->count];
+    memset(orb, 0, sizeof(*orb));
+
+    const char *v;
+    if ((v = json_find(obj_start, "label", obj_end))) {
+      const char *q = strchr(v, '"');
+      if (q) { q++; int i = 0; while (*q && *q != '"' && i < 23) orb->label[i++] = *q++; orb->label[i] = 0; }
+    }
+    // Create short label (max 7 chars) for display
+    orb->short_label[0] = 0;
+    if (orb->label[0]) {
+      int src = 0;
+      // Skip emoji prefix (📁 = F0 9F 93 81, 🌿 = F0 9F 8C BF)
+      if ((unsigned char)orb->label[0] == 0xF0) {
+        src = 4;
+        while (orb->label[src] == ' ') src++;
+      }
+      for (int k = 0; k < 7 && orb->label[src + k]; k++) orb->short_label[k] = orb->label[src + k];
+      orb->short_label[7] = 0;
+    }
+    if (!orb->short_label[0]) {
+      // Fallback to source initial
+      orb->short_label[0] = orb->source[0] ? orb->source[0] : '?';
+      orb->short_label[1] = 0;
+    }
+    if ((v = json_find(obj_start, "source", obj_end))) {
+      const char *q = strchr(v, '"');
+      if (q) { q++; int i = 0; while (*q && *q != '"' && i < 15) orb->source[i++] = *q++; orb->source[i] = 0; }
+    }
+    if ((v = json_find(obj_start, "color", obj_end))) {
+      const char *q = strchr(v, '"');
+      if (q) { q++; int i = 0; while (*q && *q != '"' && i < 15) orb->color[i++] = *q++; orb->color[i] = 0; }
+    }
+    if ((v = json_find(obj_start, "idle_seconds", obj_end))) {
+      orb->idle_seconds = strtof(v, NULL);
+    }
+    // is_primary is implied by position (first = primary)
+    orb->is_primary = (s->count == 0);
+    
+    // Initialize orbital parameters for smooth animation
+    // Distribute orbs in a ring with varying radii
+    float base_angle = (s->count * 2.0f * 3.14159f / (s->count > 0 ? s->count : 1)) - 3.14159f / 2.0f;
+    orb->orbit_angle = base_angle;
+    orb->orbit_radius = 140.0f + (s->count % 3) * 20.0f;  // 140, 160, 180 px rings
+    orb->pulse_phase = s->count * 0.7f;
+
+    // Skip to next object
+    while (*p && *p != '{') p++;
+    s->count++;
+  }
+  s->last_read = now;
+}
+
+static void draw_session_orbs(uint16_t *back, int W, int H, int STRIDE,
+                              const SessionStats *s, float global_time) {
+  if (s->count == 0) return;
+
+  // Draw orbs around the main sphere area
+  // Position them in a ring around the sphere center
+  float cx = 560.0f, cy = 240.0f;  // matches orb center in iris_fb.c
+
+  // First pass: draw connections between orbs of the same source
+  // This creates a subtle "neural network" effect linking related sessions
+  for (int i = 0; i < s->count; i++) {
+    for (int j = i + 1; j < s->count; j++) {
+      const SessionOrb *orb1 = &s->orbs[i];
+      const SessionOrb *orb2 = &s->orbs[j];
+      
+      // Only connect orbs of the same source type (cli, telegram, cron)
+      if (strcmp(orb1->source, orb2->source) != 0) continue;
+      
+      float orbit_speed1 = orb1->is_primary ? 0.12f : 0.06f;
+      float cur_angle1 = orb1->orbit_angle + global_time * orbit_speed1;
+      float px1 = cx + cosf(cur_angle1) * orb1->orbit_radius;
+      float py1 = cy + sinf(cur_angle1) * orb1->orbit_radius;
+      
+      float orbit_speed2 = orb2->is_primary ? 0.12f : 0.06f;
+      float cur_angle2 = orb2->orbit_angle + global_time * orbit_speed2;
+      float px2 = cx + cosf(cur_angle2) * orb2->orbit_radius;
+      float py2 = cy + sinf(cur_angle2) * orb2->orbit_radius;
+      
+      float dx = px2 - px1;
+      float dy = py2 - py1;
+      float dist = sqrtf(dx*dx + dy*dy);
+      
+      // Only draw connections if orbs are reasonably close
+      if (dist > 120.0f) continue;
+      
+      // Connection color matches the source
+      float r = 0.15f, g = 0.5f, b = 0.7f; // cyan default
+      if (strcmp(orb1->color, "magenta") == 0) { r = 0.7f; g = 0.2f; b = 0.5f; }
+      else if (strcmp(orb1->color, "amber") == 0) { r = 0.7f; g = 0.5f; b = 0.1f; }
+      
+      // Pulsing connection strength
+      float conn_pulse = 0.3f + 0.4f * sinf(global_time * 1.5f + (i + j) * 0.5f);
+      float alpha = conn_pulse * (1.0f - dist / 120.0f);
+      
+      // Draw line using Bresenham-like steps
+      int steps = (int)(dist / 2.0f);
+      for (int step = 0; step <= steps; step++) {
+        float t = step / (float)steps;
+        float lx = px1 + dx * t;
+        float ly = py1 + dy * t;
+        int ix = (int)lx, iy = (int)ly;
+        if (ix >= 0 && ix < W && iy >= 0 && iy < H) {
+          uint16_t *row = back + iy * (STRIDE / 2);
+          uint16_t px_val = row[ix];
+          uint16_t cr = (px_val >> 11) & 0x1F;
+          uint16_t cg = (px_val >> 5) & 0x3F;
+          uint16_t cb = px_val & 0x1F;
+          uint16_t rv = (uint16_t)(clampf(r * alpha * 0.5f, 0, 1) * 31.0f);
+          uint16_t gv = (uint16_t)(clampf(g * alpha * 0.5f, 0, 1) * 63.0f);
+          uint16_t bv = (uint16_t)(clampf(b * alpha * 0.5f, 0, 1) * 31.0f);
+          cr = (cr + rv) > 0x1F ? 0x1F : cr + rv;
+          cg = (cg + gv) > 0x3F ? 0x3F : cg + gv;
+          cb = (cb + bv) > 0x1F ? 0x1F : cb + bv;
+          row[ix] = (cr << 11) | (cg << 5) | cb;
+        }
+      }
+    }
+  }
+
+  // Second pass: draw the orbs themselves
+  for (int i = 0; i < s->count; i++) {
+    const SessionOrb *orb = &s->orbs[i];
+
+    // Orbital motion - primary moves faster, others slower
+    float orbit_speed = orb->is_primary ? 0.12f : 0.06f;
+    float cur_angle = orb->orbit_angle + global_time * orbit_speed;
+
+    float px = cx + cosf(cur_angle) * orb->orbit_radius;
+    float py = cy + sinf(cur_angle) * orb->orbit_radius;
+
+    // Pulsing size - smoother with individual phase
+    float pulse = 1.0f + 0.3f * sinf(global_time * 2.0f + orb->pulse_phase);
+    if (orb->is_primary) pulse *= 1.3f;
+    float rad = 5.0f * pulse;  // Larger base radius
+
+    // Color based on source
+    float r = 0.2f, g = 0.8f, b = 1.0f; // default cyan
+    if (strcmp(orb->color, "magenta") == 0) { r = 1.0f; g = 0.4f; b = 0.8f; }
+    else if (strcmp(orb->color, "amber") == 0) { r = 1.0f; g = 0.7f; b = 0.2f; }
+
+    // Brightness - primary is brighter, idle sessions dimmer
+    float idle_factor = orb->idle_seconds > 300 ? 0.4f : (orb->idle_seconds > 60 ? 0.7f : 1.0f);
+    float bright = orb->is_primary ? 1.0f : 0.65f;
+    bright *= idle_factor;
+    r *= bright; g *= bright; b *= bright;
+
+    // Draw filled circle with additive blending (like particles)
+    int x0 = (int)(px - rad), x1 = (int)(px + rad + 1);
+    int y0 = (int)(py - rad), y1 = (int)(py + rad + 1);
+    float inv = 1.0f / (rad * rad + 0.1f);
+    for (int y = y0; y <= y1; y++) {
+      if (y < 0 || y >= H) continue;
+      uint16_t *row = back + y * (STRIDE / 2);
+      for (int x = x0; x <= x1; x++) {
+        if (x < 0 || x >= W) continue;
+        float dx = x - px, dy = y - py, d2 = (dx * dx + dy * dy) * inv;
+        if (d2 > 1.0f) continue;
+        float k = (1.0f - d2); k *= k;
+        // Additive blend onto existing pixel
+        uint16_t px_val = row[x];
+        uint16_t cr = (px_val >> 11) & 0x1F;
+        uint16_t cg = (px_val >> 5) & 0x3F;
+        uint16_t cb = px_val & 0x1F;
+        uint16_t rv = (uint16_t)(clampf(r * k, 0, 1) * 31.0f);
+        uint16_t gv = (uint16_t)(clampf(g * k, 0, 1) * 63.0f);
+        uint16_t bv = (uint16_t)(clampf(b * k, 0, 1) * 31.0f);
+        cr = (cr + rv) > 0x1F ? 0x1F : cr + rv;
+        cg = (cg + gv) > 0x3F ? 0x3F : cg + gv;
+        cb = (cb + bv) > 0x1F ? 0x1F : cb + bv;
+        row[x] = (cr << 11) | (cg << 5) | cb;
+      }
+    }
+
+    // Draw activity particles for recently active orbs (idle < 60s)
+    if (orb->idle_seconds < 60 && (rand() % 10) < 3) {
+      // Emit a few particles from the orb
+      for (int p = 0; p < 2; p++) {
+        float angle = (rand() / (float)RAND_MAX) * 6.2831853f;
+        float speed = 10.0f + (rand() / (float)RAND_MAX) * 20.0f;
+        float part_x = px + cosf(angle) * (rad + speed * 0.1f);
+        float part_y = py + sinf(angle) * (rad + speed * 0.1f);
+        int ipx = (int)part_x, ipy = (int)part_y;
+        if (ipx >= 0 && ipx < W && ipy >= 0 && ipy < H) {
+          wput(back, W, H, STRIDE, ipx, ipy, r * 0.8f, g * 0.8f, b * 0.8f);
+        }
+      }
+    }
+
+    // Primary orb gets a subtle glow ring
+    if (orb->is_primary) {
+      float glow_rad = rad + 3.0f;
+      int gx0 = (int)(px - glow_rad), gx1 = (int)(px + glow_rad + 1);
+      int gy0 = (int)(py - glow_rad), gy1 = (int)(py + glow_rad + 1);
+      float glow_inv = 1.0f / (glow_rad * glow_rad + 0.1f);
+      for (int y = gy0; y <= gy1; y++) {
+        if (y < 0 || y >= H) continue;
+        uint16_t *row = back + y * (STRIDE / 2);
+        for (int x = gx0; x <= gx1; x++) {
+          if (x < 0 || x >= W) continue;
+          float dx = x - px, dy = y - py, d2 = (dx * dx + dy * dy) * glow_inv;
+          if (d2 > 1.0f || d2 < 0.6f) continue;  // Ring only
+          float k = (1.0f - d2) * 0.3f;  // Subtle glow
+          uint16_t px_val = row[x];
+          uint16_t cr = (px_val >> 11) & 0x1F;
+          uint16_t cg = (px_val >> 5) & 0x3F;
+          uint16_t cb = px_val & 0x1F;
+          uint16_t rv = (uint16_t)(clampf(r * k, 0, 1) * 31.0f);
+          uint16_t gv = (uint16_t)(clampf(g * k, 0, 1) * 63.0f);
+          uint16_t bv = (uint16_t)(clampf(b * k, 0, 1) * 31.0f);
+          cr = (cr + rv) > 0x1F ? 0x1F : cr + rv;
+          cg = (cg + gv) > 0x3F ? 0x3F : cg + gv;
+          cb = (cb + bv) > 0x1F ? 0x1F : cb + bv;
+          row[x] = (cr << 11) | (cg << 5) | cb;
+        }
+      }
+    }
+
+    // Draw label for ALL orbs - use float position for smooth text
+    if (orb->short_label[0]) {
+      float label_x = px + rad + 6.0f;
+      float label_y = py - 4.0f;
+      
+      // Ensure label stays on screen
+      int label_w = strlen(orb->short_label) * 6;  // 6px per char at scale 1
+      if (label_x + label_w > W - 10) label_x = px - rad - label_w - 6.0f;
+      if (label_y < 10) label_y = 10;
+      if (label_y > H - 20) label_y = H - 20;
+
+      // Draw label with a subtle background for readability
+      int lbl_x = (int)label_x, lbl_y = (int)label_y;
+      // Small background rect
+      for (int yy = -2; yy < 9; yy++) {
+        for (int xx = -2; xx < label_w + 2; xx++) {
+          int x = lbl_x + xx, y = lbl_y + yy;
+          if (x >= 0 && x < W && y >= 0 && y < H) {
+            uint16_t *row = back + y * (STRIDE / 2);
+            uint16_t px_val = row[x];
+            // Only darken if there's something there
+            if (px_val != 0) {
+              uint16_t cr = (px_val >> 11) & 0x1F;
+              uint16_t cg = (px_val >> 5) & 0x3F;
+              uint16_t cb = px_val & 0x1F;
+              cr = cr / 3; cg = cg / 3; cb = cb / 3;
+              row[x] = (cr << 11) | (cg << 5) | cb;
+            }
+          }
+        }
+      }
+      
+      wtext(back, W, H, STRIDE, lbl_x, lbl_y,
+            orb->short_label, 1, r, g, b);
+      
+      // Draw idle indicator for non-primary orbs (small dot)
+      if (!orb->is_primary && orb->idle_seconds > 60) {
+        int dot_x = lbl_x + label_w + 4;
+        int dot_y = lbl_y + 3;
+        if (dot_x < W && dot_y < H) {
+          float idle_r = orb->idle_seconds > 300 ? 0.9f : 0.9f;
+          float idle_g = orb->idle_seconds > 300 ? 0.3f : 0.7f;
+          float idle_b = 0.2f;
+          for (int dy = -2; dy <= 2; dy++) {
+            for (int dx = -2; dx <= 2; dx++) {
+              if (dx*dx + dy*dy <= 4) {
+                int x = dot_x + dx, y = dot_y + dy;
+                if (x >= 0 && x < W && y >= 0 && y < H) {
+                  wput(back, W, H, STRIDE, x, y, idle_r, idle_g, idle_b);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
 
 static void read_portfolio_stats(PortfolioStats *p) {
   memset(p, 0, sizeof(*p));

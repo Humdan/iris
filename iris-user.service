@@ -5,7 +5,9 @@ After=default.target
 [Service]
 Type=simple
 WorkingDirectory=%h/iris
-ExecStartPre=/bin/sh -c 'echo 0 > /tmp/iris_state'
+Environment=IRIS_SESSIONS_FILE=/tmp/iris_sessions.json
+ExecStartPre=/bin/sh -c 'echo 0 > /tmp/iris_state; mkdir -p /tmp && touch /tmp/iris_sessions.json; chmod 666 /tmp/iris_sessions.json'
+ExecStartPre=/bin/sh -c 'python3 %h/iris/session_watcher.py --watch --interval 2 &'
 ExecStart=%h/iris/iris_fb /tmp/iris_state
 Restart=always
 RestartSec=3

@@ -52,6 +52,10 @@ class FramebufferRenderer:
             '─': (30, 90, 110),
             '═': (40, 110, 130),
             '╌': (25, 75, 95),
+            # Session orb characters
+            '◉': (255, 150, 220),  # Magenta orb
+            '◎': (100, 230, 255),  # Cyan orb
+            '∘': (60, 160, 190),   # Dim orb
         }
         self.default_color = th[2]
 

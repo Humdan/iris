@@ -67,12 +67,10 @@ static void led_set(const char *script) {
 #define NS_TOGGLE_H 38
 
 static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec * 1e-9; }
-static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
 static float frand(void) { return rand() / (float)RAND_MAX; }
 static float smoothstep(float e0, float e1, float x) { float t = clampf((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); }
 
 // Cardiac lub-dub envelope over a normalized phase [0,1): a strong first beat
-// (lub) and a quick smaller second beat (dub) on a continuous baseline.
 // Built from two Gaussians (infinitely smooth, taper naturally to rest) so
 // expansion and contraction flow with no velocity snap. Roughly [-0.2, 1.0].
 static float heartbeat(float ph) {
@@ -299,6 +297,9 @@ int main(int argc, char **argv) {
         int    ns_running   = 0;     // night shift actively running (fresh transcript mtime)
         int    ns_manual    = 0;     // manual night shift mode toggle (0=off, 1=on)
         int    ns_manual_prev = 0;   // previous manual state for edge-triggered LED
+
+    // Session orbs state
+    SessionStats sessions = {0};
 
     // per-gesture bookkeeping tracked across frames
     int   last_seq_down = 0, last_seq_up = 0;
@@ -608,6 +609,10 @@ int main(int argc, char **argv) {
             const char *label = ns_manual ? "NIGHT SHIFT (MANUAL)" : "NIGHT SHIFT RUNNING";
             draw_night_banner(back, W, H, STRIDE, pulse, label);
         }
+
+        // --- Session orbs: draw around the main sphere ---
+        read_session_stats(&sessions);
+        draw_session_orbs(back, W, H, STRIDE, &sessions, global_time);
 
         // --- blit atomically ---
         memcpy(fb_raw, back_raw, fbsize);
