@@ -185,7 +185,7 @@ static void *touch_thread(void *arg) {
     struct input_event ev;
 
     while (running) {
-        int pr = poll(&pfd, 1, 200);   // 200ms wakeups so we notice `running`
+        int pr = poll(&pfd, 1, 10);    // 10ms wakeups — responsive touch, still notices `running`
         if (pr <= 0) continue;
         ssize_t n = read(tfd, &ev, sizeof(ev));
         if (n != (ssize_t)sizeof(ev)) continue;
@@ -451,7 +451,7 @@ int main(int argc, char **argv) {
         // ---------------------------------------------------------------
 
         // --- read activity state (0..1, or thinking/idle keywords) ---
-        if (t - tcheck > 0.1) {
+        if (t - tcheck > 0.05) {            // 20 Hz — smoother activity tracking
             tcheck = t;
             FILE *sf = fopen(state_file, "r");
             if (sf) {
@@ -501,11 +501,19 @@ int main(int argc, char **argv) {
 
         for (int i = 0; i < NPART; i++) {
             Part *p = &parts[i];
-            // advance drift (wrap theta; clamp phi so it doesn't flip poles)
+            // advance drift (wrap theta; soft-reflect phi so it doesn't bounce at poles)
             p->theta += p->dtheta * drift * dt;
             p->phi   += p->dphi   * drift * dt;
-            if (p->phi < 0.05f)  { p->phi = 0.05f;  p->dphi = -p->dphi; }
-            if (p->phi > 3.0916f){ p->phi = 3.0916f; p->dphi = -p->dphi; }
+            if (p->phi < 0.05f) {
+                float overshoot = 0.05f - p->phi;
+                p->phi = 0.05f + overshoot * 0.5f;   // soft reflection, not a hard bounce
+                p->dphi = -p->dphi * 0.7f;           // damp on reflection
+            }
+            if (p->phi > 3.0916f) {
+                float overshoot = p->phi - 3.0916f;
+                p->phi = 3.0916f - overshoot * 0.5f;
+                p->dphi = -p->dphi * 0.7f;
+            }
             p->twinkle += p->tw_spd * dt;
 
             // 3D position on shell

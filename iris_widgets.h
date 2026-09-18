@@ -799,6 +799,7 @@ typedef struct {
   char short_label[8];   // abbreviated for display (up to 7 chars + null)
   char source[16];       // "cli", "telegram", "cron"
   char color[16];        // "cyan", "magenta", "amber"
+  char session_id[64];   // unique session ID from JSON for stable matching
   int is_primary;        // 1 for most recent session
   float idle_seconds;
   float orbit_angle;     // current orbital angle for smooth motion
@@ -825,16 +826,19 @@ static void read_session_stats(SessionStats *s) {
   buf[n] = 0;
   fclose(f);
 
-  // Simple JSON parsing for the sessions array
+  // Quick validity check - must have sessions array
+  if (!strstr(buf, "\"sessions\"")) { s->count = 0; return; }
+
+  // Parse new session list
+  SessionOrb new_orbs[SESSION_MAX];
+  int new_count = 0;
   const char *p = strstr(buf, "\"sessions\"");
   if (!p) { s->count = 0; return; }
   p = strchr(p, '[');
   if (!p) { s->count = 0; return; }
 
-  s->count = 0;
   p++; // skip '['
-  while (*p && s->count < SESSION_MAX) {
-    // Find next object
+  while (*p && new_count < SESSION_MAX) {
     while (*p && *p != '{') p++;
     if (!*p) break;
     const char *obj_start = p;
@@ -849,24 +853,37 @@ static void read_session_stats(SessionStats *s) {
     }
     const char *obj_end = p;
 
-    // Parse this object
-    SessionOrb *orb = &s->orbs[s->count];
+    SessionOrb *orb = &new_orbs[new_count];
     memset(orb, 0, sizeof(*orb));
 
     const char *v;
+    char session_id[64] = {0};
+    if ((v = json_find(obj_start, "id", obj_end))) {
+      const char *q = strchr(v, '"');
+      if (q) { q++; int i = 0; while (*q && *q != '"' && i < 63) session_id[i++] = *q++; session_id[i] = 0; }
+    }
     if ((v = json_find(obj_start, "label", obj_end))) {
       const char *q = strchr(v, '"');
       if (q) { q++; int i = 0; while (*q && *q != '"' && i < 23) orb->label[i++] = *q++; orb->label[i] = 0; }
     }
+    // Decode common escaped Unicode in label (e.g., \ud83d\udcc1 -> 📁)
+    for (char *p = orb->label; *p; p++) {
+      if (p[0] == '\\' && p[1] == 'u' && p[6] == '\\' && p[7] == 'u') {
+        // Surrogate pair \uD83D\uDCC1 -> 📁
+        // Just replace with a simple marker since we can't render full UTF-8 in 5x7 font
+        memmove(p + 1, p + 12, strlen(p + 12) + 1);
+        p[0] = 'F'; // folder marker
+      }
+    }
+    // Store session_id for stable matching across reads
+    strncpy(orb->session_id, session_id, sizeof(orb->session_id) - 1);
+    orb->session_id[sizeof(orb->session_id) - 1] = 0;
     // Create short label (max 7 chars) for display
     orb->short_label[0] = 0;
     if (orb->label[0]) {
       int src = 0;
-      // Skip emoji prefix (📁 = F0 9F 93 81, 🌿 = F0 9F 8C BF)
-      if ((unsigned char)orb->label[0] == 0xF0) {
-        src = 4;
-        while (orb->label[src] == ' ') src++;
-      }
+      // Skip folder marker we inserted
+      if (orb->label[0] == 'F' && orb->label[1] == ' ') src = 2;
       for (int k = 0; k < 7 && orb->label[src + k]; k++) orb->short_label[k] = orb->label[src + k];
       orb->short_label[7] = 0;
     }
@@ -887,19 +904,36 @@ static void read_session_stats(SessionStats *s) {
       orb->idle_seconds = strtof(v, NULL);
     }
     // is_primary is implied by position (first = primary)
-    orb->is_primary = (s->count == 0);
-    
-    // Initialize orbital parameters for smooth animation
-    // Distribute orbs in a ring with varying radii
-    float base_angle = (s->count * 2.0f * 3.14159f / (s->count > 0 ? s->count : 1)) - 3.14159f / 2.0f;
-    orb->orbit_angle = base_angle;
-    orb->orbit_radius = 140.0f + (s->count % 3) * 20.0f;  // 140, 160, 180 px rings
-    orb->pulse_phase = s->count * 0.7f;
+    orb->is_primary = (new_count == 0);
 
-    // Skip to next object
+    // Initialize orbital parameters ONLY for new orbs (not seen before)
+    // Match by session_id to preserve orbital state across reads
+    int found = 0;
+    for (int i = 0; i < s->count; i++) {
+      if (s->orbs[i].session_id[0] && strcmp(s->orbs[i].session_id, session_id) == 0) {
+        // Preserve existing orbital state
+        orb->orbit_angle = s->orbs[i].orbit_angle;
+        orb->orbit_radius = s->orbs[i].orbit_radius;
+        orb->pulse_phase = s->orbs[i].pulse_phase;
+        found = 1;
+        break;
+      }
+    }
+    if (!found) {
+      // New orb: initialize orbital parameters
+      float base_angle = (new_count * 2.0f * 3.14159f / (new_count > 0 ? new_count : 1)) - 3.14159f / 2.0f;
+      orb->orbit_angle = base_angle;
+      orb->orbit_radius = 140.0f + (new_count % 3) * 20.0f;
+      orb->pulse_phase = new_count * 0.7f;
+    }
+
     while (*p && *p != '{') p++;
-    s->count++;
+    new_count++;
   }
+
+  // Commit new orb list (preserves orbital state for matching sessions)
+  memcpy(s->orbs, new_orbs, sizeof(SessionOrb) * new_count);
+  s->count = new_count;
   s->last_read = now;
 }
 
@@ -907,73 +941,36 @@ static void draw_session_orbs(uint16_t *back, int W, int H, int STRIDE,
                               const SessionStats *s, float global_time) {
   if (s->count == 0) return;
 
+  // Read activity level (0..1) from Hermes state file
+  float act = 0.0f;
+  FILE *sf = fopen("/tmp/iris_state", "r");
+  if (sf) {
+    char buf[64] = {0};
+    if (fgets(buf, 63, sf)) {
+      if (strncmp(buf, "thinking", 8) == 0) act = 1.0f;
+      else if (strncmp(buf, "idle", 4) == 0) act = 0.0f;
+      else {
+        char *end;
+        float x = strtof(buf, &end);
+        if (end != buf) act = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
+      }
+    }
+    fclose(sf);
+  }
+
   // Draw orbs around the main sphere area
   // Position them in a ring around the sphere center
   float cx = 560.0f, cy = 240.0f;  // matches orb center in iris_fb.c
 
-  // First pass: draw connections between orbs of the same source
-  // This creates a subtle "neural network" effect linking related sessions
-  for (int i = 0; i < s->count; i++) {
-    for (int j = i + 1; j < s->count; j++) {
-      const SessionOrb *orb1 = &s->orbs[i];
-      const SessionOrb *orb2 = &s->orbs[j];
-      
-      // Only connect orbs of the same source type (cli, telegram, cron)
-      if (strcmp(orb1->source, orb2->source) != 0) continue;
-      
-      float orbit_speed1 = orb1->is_primary ? 0.12f : 0.06f;
-      float cur_angle1 = orb1->orbit_angle + global_time * orbit_speed1;
-      float px1 = cx + cosf(cur_angle1) * orb1->orbit_radius;
-      float py1 = cy + sinf(cur_angle1) * orb1->orbit_radius;
-      
-      float orbit_speed2 = orb2->is_primary ? 0.12f : 0.06f;
-      float cur_angle2 = orb2->orbit_angle + global_time * orbit_speed2;
-      float px2 = cx + cosf(cur_angle2) * orb2->orbit_radius;
-      float py2 = cy + sinf(cur_angle2) * orb2->orbit_radius;
-      
-      float dx = px2 - px1;
-      float dy = py2 - py1;
-      float dist = sqrtf(dx*dx + dy*dy);
-      
-      // Only draw connections if orbs are reasonably close
-      if (dist > 120.0f) continue;
-      
-      // Connection color matches the source
-      float r = 0.15f, g = 0.5f, b = 0.7f; // cyan default
-      if (strcmp(orb1->color, "magenta") == 0) { r = 0.7f; g = 0.2f; b = 0.5f; }
-      else if (strcmp(orb1->color, "amber") == 0) { r = 0.7f; g = 0.5f; b = 0.1f; }
-      
-      // Pulsing connection strength
-      float conn_pulse = 0.3f + 0.4f * sinf(global_time * 1.5f + (i + j) * 0.5f);
-      float alpha = conn_pulse * (1.0f - dist / 120.0f);
-      
-      // Draw line using Bresenham-like steps
-      int steps = (int)(dist / 2.0f);
-      for (int step = 0; step <= steps; step++) {
-        float t = step / (float)steps;
-        float lx = px1 + dx * t;
-        float ly = py1 + dy * t;
-        int ix = (int)lx, iy = (int)ly;
-        if (ix >= 0 && ix < W && iy >= 0 && iy < H) {
-          uint16_t *row = back + iy * (STRIDE / 2);
-          uint16_t px_val = row[ix];
-          uint16_t cr = (px_val >> 11) & 0x1F;
-          uint16_t cg = (px_val >> 5) & 0x3F;
-          uint16_t cb = px_val & 0x1F;
-          uint16_t rv = (uint16_t)(clampf(r * alpha * 0.5f, 0, 1) * 31.0f);
-          uint16_t gv = (uint16_t)(clampf(g * alpha * 0.5f, 0, 1) * 63.0f);
-          uint16_t bv = (uint16_t)(clampf(b * alpha * 0.5f, 0, 1) * 31.0f);
-          cr = (cr + rv) > 0x1F ? 0x1F : cr + rv;
-          cg = (cg + gv) > 0x3F ? 0x3F : cg + gv;
-          cb = (cb + bv) > 0x1F ? 0x1F : cb + bv;
-          row[ix] = (cr << 11) | (cg << 5) | cb;
-        }
-      }
-    }
-  }
+  // Pre-compute orb positions and colors for connection drawing
+  #define MAX_ORBS 16
+  int orb_count = s->count;
+  if (orb_count > MAX_ORBS) orb_count = MAX_ORBS;
+  float orb_x[MAX_ORBS], orb_y[MAX_ORBS];
+  float orb_r[MAX_ORBS], orb_g[MAX_ORBS], orb_b[MAX_ORBS];
+  float orb_rad[MAX_ORBS];
 
-  // Second pass: draw the orbs themselves
-  for (int i = 0; i < s->count; i++) {
+  for (int i = 0; i < orb_count; i++) {
     const SessionOrb *orb = &s->orbs[i];
 
     // Orbital motion - primary moves faster, others slower
@@ -984,9 +981,9 @@ static void draw_session_orbs(uint16_t *back, int W, int H, int STRIDE,
     float py = cy + sinf(cur_angle) * orb->orbit_radius;
 
     // Pulsing size - smoother with individual phase
-    float pulse = 1.0f + 0.3f * sinf(global_time * 2.0f + orb->pulse_phase);
-    if (orb->is_primary) pulse *= 1.3f;
-    float rad = 5.0f * pulse;  // Larger base radius
+    float pulse = 1.0f + 0.25f * sinf(global_time * 1.5f + orb->pulse_phase);
+    if (orb->is_primary) pulse *= 1.2f;
+    float rad = 4.0f * pulse;  // Slightly smaller, cleaner
 
     // Color based on source
     float r = 0.2f, g = 0.8f, b = 1.0f; // default cyan
@@ -998,6 +995,89 @@ static void draw_session_orbs(uint16_t *back, int W, int H, int STRIDE,
     float bright = orb->is_primary ? 1.0f : 0.65f;
     bright *= idle_factor;
     r *= bright; g *= bright; b *= bright;
+
+    orb_x[i] = px;
+    orb_y[i] = py;
+    orb_r[i] = r;
+    orb_g[i] = g;
+    orb_b[i] = b;
+    orb_rad[i] = rad;
+  }
+
+  // Draw connections (knowledge graph) between orbs of same source when agents are working
+  if (act > 0.1f) {
+    for (int i = 0; i < orb_count; i++) {
+      for (int j = i + 1; j < orb_count; j++) {
+        // Check if same source (color string)
+        const SessionOrb *orb_i = &s->orbs[i];
+        const SessionOrb *orb_j = &s->orbs[j];
+        if (strcmp(orb_i->color, orb_j->color) != 0) continue;
+
+        float dx = orb_x[j] - orb_x[i];
+        float dy = orb_y[j] - orb_y[i];
+        float dist = sqrtf(dx*dx + dy*dy);
+        if (dist > 120.0f) continue; // only connect nearby orbs
+
+        // Line intensity based on activity and a subtle pulse
+        float base_intensity = act * 0.6f;
+        float pulse = 0.5f + 0.5f * sinf(global_time * 2.0f + (i + j) * 0.13f);
+        float intensity = base_intensity * pulse;
+        if (intensity <= 0.0f) continue;
+
+        // Derive line color from orb color (same for both ends)
+        float lr = orb_r[i];
+        float lg = orb_g[i];
+        float lb = orb_b[i];
+        // Scale by intensity
+        lr *= intensity; lg *= intensity; lb *= intensity;
+
+        // Draw line using simple DDS algorithm with additive blending
+        int steps = (int)dist;
+        if (steps < 1) steps = 1;
+        for (int k = 0; k <= steps; k++) {
+          float t = (float)k / (float)steps;
+          float x = orb_x[i] + dx * t;
+          float y = orb_y[i] + dy * t;
+          // Draw a small dot (radius 1) for thickness
+          int x0 = (int)(x - 1), x1 = (int)(x + 1 + 1);
+          int y0 = (int)(y - 1), y1 = (int)(y + 1 + 1);
+          float inv = 1.0f / (1.0f * 1.0f + 0.1f);
+          for (int yy = y0; yy <= y1; yy++) {
+            if (yy < 0 || yy >= H) continue;
+            uint16_t *row = back + yy * (STRIDE / 2);
+            for (int xx = x0; xx <= x1; xx++) {
+              if (xx < 0 || xx >= W) continue;
+              float dx2 = xx - x, dy2 = yy - y, d2 = (dx2*dx2 + dy2*dy2) * inv;
+              if (d2 > 1.0f) continue;
+              float kk = (1.0f - d2); kk *= kk;
+              uint16_t px_val = row[xx];
+              uint16_t cr = (px_val >> 11) & 0x1F;
+              uint16_t cg = (px_val >> 5) & 0x3F;
+              uint16_t cb = px_val & 0x1F;
+              uint16_t rv = (uint16_t)(clampf(lr * kk, 0, 1) * 31.0f);
+              uint16_t gv = (uint16_t)(clampf(lg * kk, 0, 1) * 63.0f);
+              uint16_t bv = (uint16_t)(clampf(lb * kk, 0, 1) * 31.0f);
+              cr = (cr + rv) > 0x1F ? 0x1F : cr + rv;
+              cg = (cg + gv) > 0x3F ? 0x3F : cg + gv;
+              cb = (cb + bv) > 0x1F ? 0x1F : cb + bv;
+              row[xx] = (cr << 11) | (cg << 5) | cb;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Second pass: draw the orbs themselves (clean, no connections)
+  for (int i = 0; i < orb_count; i++) {
+    const SessionOrb *orb = &s->orbs[i];
+
+    float px = orb_x[i];
+    float py = orb_y[i];
+    float rad = orb_rad[i];
+    float r = orb_r[i];
+    float g = orb_g[i];
+    float b = orb_b[i];
 
     // Draw filled circle with additive blending (like particles)
     int x0 = (int)(px - rad), x1 = (int)(px + rad + 1);
@@ -1026,105 +1106,23 @@ static void draw_session_orbs(uint16_t *back, int W, int H, int STRIDE,
       }
     }
 
-    // Draw activity particles for recently active orbs (idle < 60s)
-    if (orb->idle_seconds < 60 && (rand() % 10) < 3) {
-      // Emit a few particles from the orb
-      for (int p = 0; p < 2; p++) {
-        float angle = (rand() / (float)RAND_MAX) * 6.2831853f;
-        float speed = 10.0f + (rand() / (float)RAND_MAX) * 20.0f;
-        float part_x = px + cosf(angle) * (rad + speed * 0.1f);
-        float part_y = py + sinf(angle) * (rad + speed * 0.1f);
-        int ipx = (int)part_x, ipy = (int)part_y;
-        if (ipx >= 0 && ipx < W && ipy >= 0 && ipy < H) {
-          wput(back, W, H, STRIDE, ipx, ipy, r * 0.8f, g * 0.8f, b * 0.8f);
-        }
-      }
-    }
-
-    // Primary orb gets a subtle glow ring
-    if (orb->is_primary) {
-      float glow_rad = rad + 3.0f;
-      int gx0 = (int)(px - glow_rad), gx1 = (int)(px + glow_rad + 1);
-      int gy0 = (int)(py - glow_rad), gy1 = (int)(py + glow_rad + 1);
-      float glow_inv = 1.0f / (glow_rad * glow_rad + 0.1f);
-      for (int y = gy0; y <= gy1; y++) {
-        if (y < 0 || y >= H) continue;
-        uint16_t *row = back + y * (STRIDE / 2);
-        for (int x = gx0; x <= gx1; x++) {
-          if (x < 0 || x >= W) continue;
-          float dx = x - px, dy = y - py, d2 = (dx * dx + dy * dy) * glow_inv;
-          if (d2 > 1.0f || d2 < 0.6f) continue;  // Ring only
-          float k = (1.0f - d2) * 0.3f;  // Subtle glow
-          uint16_t px_val = row[x];
-          uint16_t cr = (px_val >> 11) & 0x1F;
-          uint16_t cg = (px_val >> 5) & 0x3F;
-          uint16_t cb = px_val & 0x1F;
-          uint16_t rv = (uint16_t)(clampf(r * k, 0, 1) * 31.0f);
-          uint16_t gv = (uint16_t)(clampf(g * k, 0, 1) * 63.0f);
-          uint16_t bv = (uint16_t)(clampf(b * k, 0, 1) * 31.0f);
-          cr = (cr + rv) > 0x1F ? 0x1F : cr + rv;
-          cg = (cg + gv) > 0x3F ? 0x3F : cg + gv;
-          cb = (cb + bv) > 0x1F ? 0x1F : cb + bv;
-          row[x] = (cr << 11) | (cg << 5) | cb;
-        }
-      }
-    }
-
-    // Draw label for ALL orbs - use float position for smooth text
+    // Draw label for ALL orbs - clean, no background
     if (orb->short_label[0]) {
       float label_x = px + rad + 6.0f;
       float label_y = py - 4.0f;
-      
+
       // Ensure label stays on screen
       int label_w = strlen(orb->short_label) * 6;  // 6px per char at scale 1
       if (label_x + label_w > W - 10) label_x = px - rad - label_w - 6.0f;
       if (label_y < 10) label_y = 10;
       if (label_y > H - 20) label_y = H - 20;
 
-      // Draw label with a subtle background for readability
-      int lbl_x = (int)label_x, lbl_y = (int)label_y;
-      // Small background rect
-      for (int yy = -2; yy < 9; yy++) {
-        for (int xx = -2; xx < label_w + 2; xx++) {
-          int x = lbl_x + xx, y = lbl_y + yy;
-          if (x >= 0 && x < W && y >= 0 && y < H) {
-            uint16_t *row = back + y * (STRIDE / 2);
-            uint16_t px_val = row[x];
-            // Only darken if there's something there
-            if (px_val != 0) {
-              uint16_t cr = (px_val >> 11) & 0x1F;
-              uint16_t cg = (px_val >> 5) & 0x3F;
-              uint16_t cb = px_val & 0x1F;
-              cr = cr / 3; cg = cg / 3; cb = cb / 3;
-              row[x] = (cr << 11) | (cg << 5) | cb;
-            }
-          }
-        }
-      }
-      
-      wtext(back, W, H, STRIDE, lbl_x, lbl_y,
-            orb->short_label, 1, r, g, b);
-      
-      // Draw idle indicator for non-primary orbs (small dot)
-      if (!orb->is_primary && orb->idle_seconds > 60) {
-        int dot_x = lbl_x + label_w + 4;
-        int dot_y = lbl_y + 3;
-        if (dot_x < W && dot_y < H) {
-          float idle_r = orb->idle_seconds > 300 ? 0.9f : 0.9f;
-          float idle_g = orb->idle_seconds > 300 ? 0.3f : 0.7f;
-          float idle_b = 0.2f;
-          for (int dy = -2; dy <= 2; dy++) {
-            for (int dx = -2; dx <= 2; dx++) {
-              if (dx*dx + dy*dy <= 4) {
-                int x = dot_x + dx, y = dot_y + dy;
-                if (x >= 0 && x < W && y >= 0 && y < H) {
-                  wput(back, W, H, STRIDE, x, y, idle_r, idle_g, idle_b);
-                }
-              }
-            }
-          }
-        }
-      }
+      // Primary orb gets slightly brighter label
+      float lr = r, lg = g, lb = b;
+      if (!orb->is_primary) { lr *= 0.7f; lg *= 0.7f; lb *= 0.7f; }
+
+      wtext(back, W, H, STRIDE, (int)label_x, (int)label_y,
+            orb->short_label, 1, lr, lg, lb);
     }
   }
 }
