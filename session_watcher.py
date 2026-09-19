@@ -36,6 +36,9 @@ def get_active_sessions():
         # Compute idle time
         last_active = session.get('last_activity_at') or session.get('started_at') or now
         session['idle_seconds'] = now - last_active
+        # Filter out stale sessions (idle > 1 hour) - Hermes doesn't close them properly
+        if session['idle_seconds'] > 3600:
+            continue
         # Short label for display
         if session['source'] == 'telegram':
             session['label'] = session.get('display_name') or 'Telegram'
@@ -80,7 +83,7 @@ def main():
             'sessions': sessions
         }
         # Atomic write
-        tmp = output_path.with_suffix('.tmp')
+        tmp = output_path.with_name(f'.{output_path.name}.{os.getpid()}.tmp')
         tmp.write_text(json.dumps(data))
         tmp.replace(output_path)
         print(f"[{time.strftime('%H:%M:%S')}] Active sessions: {len(sessions)}")

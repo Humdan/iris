@@ -1,6 +1,7 @@
-// iris_fb.c — particle sphere-shell visualizer, activity-driven.
-// Particles drift on a slowly rotating sphere shell; cyan/blue on black.
-// Idle: slow gentle drift, dim. Thinking (act->1): faster, brighter swarm + sparks.
+// iris_fb.c — "digital organism" visualizer, activity-driven.
+// A golden holographic lattice (iris_organism.h) that breathes, grows and
+// sheds circuit traces and pulses with a heartbeat. Idle: deep amber, slow.
+// Thinking (act->1): brighter gold, faster, more traces, ripples and embers.
 // Reuses the proven scaffolding: mmap fb0, RGB565, float compose in back buffer,
 // one memcpy blit per frame, absolute-clock pacing.
 
@@ -20,10 +21,9 @@
 #include <poll.h>
 #include <errno.h>
 #include <linux/input.h>
+#include <sys/file.h>
 #include "iris_widgets.h"
-
-#define NPART 700          // particles on the shell
-#define NSPARK 64          // travelling sparks (activity)
+#include "iris_organism.h"
 
 static volatile int running = 1;
 static void on_sig(int s) { (void)s; running = 0; }
@@ -57,14 +57,12 @@ static void led_set(const char *script) {
     }
 }
 
-// Manual night-shift toggle pill geometry (bottom agent panel).
-// MUST match the visible pill drawn in draw_agent_panel() (iris_widgets.h):
-//   pill at (460, H-38) size 72x18. The tap zone is padded ~10px around it so
-//   a fingertip reliably lands. Keep these in sync with NS_PILL_* in the header.
-#define NS_TOGGLE_X 450
-#define NS_TOGGLE_Y (H - 48)
-#define NS_TOGGLE_W 92
-#define NS_TOGGLE_H 38
+// Manual night-shift toggle: the visible NIGHT pill drawn by draw_agent_panel()
+// (NS_PILL_* in iris_widgets.h), padded ~10px so a fingertip reliably lands.
+#define NS_TOGGLE_X (NS_PILL_X - 10)
+#define NS_TOGGLE_Y (NS_PILL_Y(H) - 10)
+#define NS_TOGGLE_W (NS_PILL_W + 20)
+#define NS_TOGGLE_H (NS_PILL_H + 20)
 
 static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec * 1e-9; }
 static float frand(void) { return rand() / (float)RAND_MAX; }
@@ -84,65 +82,6 @@ static float heartbeat(float ph) {
     float d_rest = ph - 0.68f; if (d_rest > 0.5f) d_rest -= 1.0f; if (d_rest < -0.5f) d_rest += 1.0f;
     float dip = -0.18f * expf(-(d_rest * d_rest) / (2.0f * 0.14f * 0.14f));
     return lub + dub + dip;
-}
-
-// A particle lives in 3D on/near a unit sphere shell. It drifts by a small
-// angular velocity in spherical space so it never leaves the shell (smooth,
-// no popping, no re-seeding jitter).
-typedef struct {
-    float theta, phi;      // spherical position (drifts)
-    float dtheta, dphi;    // angular drift velocity
-    float r;               // radius ~1 with small per-particle offset
-    float twinkle;         // phase for gentle brightness variation
-    float tw_spd;
-} Part;
-
-// A spark rides outward from the shell surface and fades — only when active.
-typedef struct { float x, y, z, vx, vy, vz, life; } Spark;
-
-static Part parts[NPART];
-static Spark sparks[NSPARK];
-
-static inline void blend_pixel_16(uint16_t *p, float r, float g, float b) {
-    uint16_t rv = (uint16_t)(clampf(r, 0, 1) * 31.0f) & 0x1F;
-    uint16_t gv = (uint16_t)(clampf(g, 0, 1) * 63.0f) & 0x3F;
-    uint16_t bv = (uint16_t)(clampf(b, 0, 1) * 31.0f) & 0x1F;
-    uint16_t cr = (*p >> 11) & 0x1F;
-    uint16_t cg = (*p >> 5) & 0x3F;
-    uint16_t cb = *p & 0x1F;
-    cr = (cr + rv) > 0x1F ? 0x1F : cr + rv;
-    cg = (cg + gv) > 0x3F ? 0x3F : cg + gv;
-    cb = (cb + bv) > 0x1F ? 0x1F : cb + bv;
-    *p = (cr << 11) | (cg << 5) | cb;
-}
-
-static void dot_16(uint16_t *fb, int W, int H, int STRIDE, float cx, float cy, float rad, float r, float g, float b) {
-    int x0 = (int)(cx - rad), x1 = (int)(cx + rad + 1), y0 = (int)(cy - rad), y1 = (int)(cy + rad + 1);
-    float inv = 1.0f / (rad * rad + 0.1f);
-    for (int y = y0; y <= y1; y++) {
-        if (y < 0 || y >= H) continue;
-        uint16_t *row = fb + y * (STRIDE / 2);
-        for (int x = x0; x <= x1; x++) {
-            if (x < 0 || x >= W) continue;
-            float dx = x - cx, dy = y - cy, d2 = (dx * dx + dy * dy) * inv;
-            if (d2 > 1.0f) continue;
-            float k = (1 - d2); k *= k;
-            blend_pixel_16(&row[x], r * k, g * k, b * k);
-        }
-    }
-}
-
-static void spawn_spark(float theta, float phi, float r, float act) {
-    // Direction: mostly radially outward from the shell.
-    float sx = sinf(phi) * cosf(theta);
-    float sy = cosf(phi);
-    float sz = sinf(phi) * sinf(theta);
-    for (int i = 0; i < NSPARK; i++) if (sparks[i].life <= 0) {
-        float sp = 0.4f + 0.6f * act + frand() * 0.3f;
-        sparks[i] = (Spark){ sx * r, sy * r, sz * r,
-                             sx * sp, sy * sp, sz * sp, 1.0f };
-        return;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -227,9 +166,22 @@ static void *touch_thread(void *arg) {
 
 int main(int argc, char **argv) {
     const char *state_file = argc > 1 ? argv[1] : "/tmp/iris_state";
-    signal(SIGINT, on_sig);
-    signal(SIGTERM, on_sig);
+    // No SA_RESTART: SIGTERM must interrupt a blocking standby flock() below.
+    struct sigaction sa; memset(&sa, 0, sizeof(sa)); sa.sa_handler = on_sig;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
     signal(SIGCHLD, SIG_IGN);   // auto-reap forked hermes-cron children (no zombies)
+
+    // Single instance: two renderers blitting to the same framebuffer take
+    // turns overwriting each other's frames (heavy flicker). A second copy
+    // (e.g. both the system and the user iris.service) waits here as a quiet
+    // standby and takes over only if the running one exits.
+    int lock_fd = open("/tmp/iris_fb.lock", O_RDWR | O_CREAT, 0666);
+    if (lock_fd >= 0 && flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
+        fprintf(stderr, "iris_fb: another instance owns the screen; waiting as standby\n");
+        while (running && flock(lock_fd, LOCK_EX) < 0 && errno == EINTR) {}
+        if (!running) return 0;
+    }
 
     int fd = open("/dev/fb0", O_RDWR);
     if (fd < 0) { perror("open /dev/fb0"); return 1; }
@@ -249,28 +201,22 @@ int main(int argc, char **argv) {
     fprintf(stderr, "iris_fb (particles): %dx%d %dbpp stride %d\n", W, H, BPP, STRIDE);
 
     srand(42);
-    // Orb offset into the free area, pushed right to use open space.
-    float ox = 560.0f, oy = 240.0f;
-    float scale = 137.0f;
+    // Orb fills the free area: right of the queue column (ends ~x=280), above
+    // the bottom panel (starts y=414). Its top passes to the right of the
+    // clock/date text (which ends at x~496), so it can rise almost to the top.
+    // SPHERE_R_MAX is the largest on-screen radius at full activity + heartbeat
+    // peak; `scale` is derived from it so the busiest frame still fits.
+    const float SPHERE_R_MAX = 195.0f;
+    float ox = 575.0f, oy = 214.0f;
+    const float GROW = 0.06f, AMP_IDLE = 0.015f, AMP_BUSY = 0.05f;
+    float scale = SPHERE_R_MAX / (ORG_EXTENT * (1.0f + GROW) * (1.0f + (AMP_IDLE + AMP_BUSY) * 1.05f));
 
-    // Seed particles uniformly on the shell (Fibonacci-ish) with slow drift.
-    for (int i = 0; i < NPART; i++) {
-        float y = 1.0f - 2.0f * (i + 0.5f) / NPART;   // -1..1
-        parts[i].phi = acosf(clampf(y, -1, 1));
-        parts[i].theta = 3.14159f * (1.0f + sqrtf(5.0f)) * i;
-        parts[i].r = 0.94f + frand() * 0.12f;          // slight shell thickness
-        // small tangential drift, random sign — very slow
-        parts[i].dtheta = (frand() - 0.5f) * 0.10f;
-        parts[i].dphi   = (frand() - 0.5f) * 0.04f;
-        parts[i].twinkle = frand() * 6.2831853f;
-        parts[i].tw_spd  = 0.4f + frand() * 0.8f;
-    }
-    for (int i = 0; i < NSPARK; i++) sparks[i].life = 0;
+    org_init(scale);
 
     float act = 0, target = 0;
     double t0 = now(), tlast = t0, tcheck = 0, tfps = t0, tnext = t0, tstats = 0;
     int frames = 0;
-    float global_time = 0, spark_time = 0;
+    float global_time = 0;
     FeedStats stats; read_stats(&stats);   // clock + tool-call feed, refreshed ~1 Hz below
     AgentStats agent; read_agent_stats(&agent);
     PortfolioStats portfolio; read_portfolio_stats(&portfolio);
@@ -383,11 +329,13 @@ int main(int argc, char **argv) {
                 // job row is selected. RUN NOW lives inside that big panel.
                 int ns_console_showing = ns_manual || ns_running ||
                     (sel_job >= 0 && strcmp(stats.names[sel_job], NS_JOB_NAME) == 0);
-                if (ns_console_showing &&
-                    upx >= NSC_BTN_X && upx < NSC_BTN_X + NSC_BTN_W &&
-                    upy >= NSC_BTN_Y && upy < NSC_BTN_Y + NSC_BTN_H) {
-                    ns_fire_job();          // fork+exec detached; returns instantly
-                    ns_fire_at = t;         // show FIRING feedback briefly
+                // Top-right NIGHT SHIFT button (padded tap zone). Fires only when
+                // no run is live and it wasn't just tapped (no double starts).
+                if (upx >= NS_RUN_X - 8 && upy < NS_RUN_Y + NS_RUN_H + 10) {
+                    if (!ns_running && t - ns_fire_at > 60.0) {
+                        ns_fire_job();      // fork+exec detached; returns instantly
+                        ns_fire_at = t;
+                    }
                     handled = 1;
                 } else if (ns_console_showing &&
                     upx >= NSC_X && upx < NSC_X + NSC_W &&
@@ -467,31 +415,24 @@ int main(int argc, char **argv) {
         // rise fast, fall slow (eased)
         act += (target - act) * (1.0f - expf(-(target > act ? 4.0f : 0.8f) * dt));
 
-        // --- slow eased forward/back rotation of the whole shell (Y axis) ---
-        float period = 80.0f;
-        float phase = fmodf(global_time, period) / period;
-        float tri = phase < 0.5f ? phase * 2.0f : (1.0f - phase) * 2.0f;
-        float eased = tri * tri * tri * (tri * (tri * 6.0f - 15.0f) + 10.0f);
-        float rot = eased * 6.2831853f + touch_offset;   // yaw = auto + touch-driven offset
-        float cr = cosf(rot), sr = sinf(rot);             // yaw (Y-axis)
-        float cp = cosf(pitch_offset), sp = sinf(pitch_offset);  // pitch (X-axis), touch-only
-
-        // drift speed scales gently with activity
-        float drift = 0.5f + 1.3f * act;
+        // --- orientation: slow organic sway (never a mechanical back-and-forth
+        //     swing) plus the touch-driven yaw/pitch offsets ---
+        float yaw   = 0.35f * sinf(global_time * 0.071f) + 0.12f * sinf(global_time * 0.19f + 1.3f) + touch_offset;
+        float pitch = 0.22f * sinf(global_time * 0.053f + 0.7f) + pitch_offset;
 
         // Sphere expands when working AND breathes like a heartbeat.
-        //  - base growth: eases toward +35% at full activity (bigger than before)
+        //  - base growth: eases toward +GROW at full activity (bounded by SPHERE_R_MAX)
         //  - heartbeat: a periodic expand/contract, amplitude scales with activity
         //    so idle barely breathes and thinking pulses clearly.
         static float scale_dyn = 1.0f;
-        float base_target = 1.0f + 0.35f * act;
+        float base_target = 1.0f + GROW * act;
         scale_dyn += (base_target - scale_dyn) * (1.0f - expf(-2.5f * dt));
         // Cardiac lub-dub. Beat rate rises with activity (~0.5 Hz calm -> ~1.3 Hz busy);
-        // amplitude tiny at idle, deep when working (up to +/-20%).
+        // amplitude tiny at idle, deeper when working (AMP_IDLE..AMP_IDLE+AMP_BUSY).
         static float beat_phase = 0.0f;
-        float beat_hz = 0.5f + 0.5f * act;
+        float beat_hz = 0.35f + 0.65f * act;   // slow resting pulse
         beat_phase += beat_hz * dt;
-        float amp = 0.015f + 0.20f * act;
+        float amp = AMP_IDLE + AMP_BUSY * act;
         float breathe = 1.0f + amp * heartbeat(beat_phase);
         float escale = scale * scale_dyn * breathe;
 
@@ -499,84 +440,12 @@ int main(int argc, char **argv) {
         memset(back_raw, 0, fbsize);
         uint16_t *back = (uint16_t *)back_raw;
 
-        for (int i = 0; i < NPART; i++) {
-            Part *p = &parts[i];
-            // advance drift (wrap theta; soft-reflect phi so it doesn't bounce at poles)
-            p->theta += p->dtheta * drift * dt;
-            p->phi   += p->dphi   * drift * dt;
-            if (p->phi < 0.05f) {
-                float overshoot = 0.05f - p->phi;
-                p->phi = 0.05f + overshoot * 0.5f;   // soft reflection, not a hard bounce
-                p->dphi = -p->dphi * 0.7f;           // damp on reflection
-            }
-            if (p->phi > 3.0916f) {
-                float overshoot = p->phi - 3.0916f;
-                p->phi = 3.0916f - overshoot * 0.5f;
-                p->dphi = -p->dphi * 0.7f;
-            }
-            p->twinkle += p->tw_spd * dt;
-
-            // 3D position on shell
-            float sx = sinf(p->phi) * cosf(p->theta) * p->r;
-            float sy = cosf(p->phi) * p->r;
-            float sz = sinf(p->phi) * sinf(p->theta) * p->r;
-            // Apply pitch FIRST (about the SCREEN x-axis) then yaw (about world Y).
-            // Order matters: pitching before yaw keeps "up is always up" no matter
-            // how far the sphere has been spun, so a vertical drag always tips the
-            // top toward/away from the viewer instead of flipping once yaw>90deg.
-            float y1 = sy * cp - sz * sp;   // pitch tilts (y,z)
-            float z1 = sy * sp + sz * cp;
-            float xr = sx * cr + z1 * sr;   // yaw about Y
-            float zr2 = -sx * sr + z1 * cr;
-            float yr2 = y1;
-
-            float depth = 0.80f + 0.20f * zr2;   // 0.6..1.0, front = brighter/bigger
-            float px = ox + xr * escale * depth;
-            float py = oy + yr2 * escale * depth;
-
-            // brightness: brighter baseline, gentle twinkle, lifts with activity, dims with depth
-            float tw = 0.75f + 0.25f * sinf(p->twinkle);
-            float bright = (0.62f + 0.38f * act) * tw * depth;
-            float rad = 1.6f + 1.0f * act + 0.8f * depth;
-
-            // hue shift: cyan (idle) -> warm amber/gold (active), eased with act
-            // cyan base:  (0.05, 0.45, 0.95)
-            // amber target: (1.00, 0.55, 0.10)
-            float base_r = 0.05f + 0.95f * act;
-            float base_g = 0.45f + 0.10f * act;
-            float base_b = 0.95f - 0.80f * act;
-            float rr = bright * base_r;
-            float gg = bright * base_g;
-            float bb = bright * base_b;
-            dot_16(back, W, H, STRIDE, px, py, rad, rr, gg, bb);
-        }
-
-        // --- sparks: emitted when active, fly outward, fade ---
-        spark_time += dt;
-        float spark_interval = 0.5f - 0.45f * act;   // idle: rare/none, active: frequent
-        if (act > 0.15f && spark_time > spark_interval) {
-            spark_time = 0;
-            int src = rand() % NPART;
-            spawn_spark(parts[src].theta, parts[src].phi, parts[src].r, act);
-        }
-        for (int i = 0; i < NSPARK; i++) {
-            Spark *s = &sparks[i];
-            if (s->life <= 0) continue;
-            s->x += s->vx * dt; s->y += s->vy * dt; s->z += s->vz * dt;
-            s->life -= dt * 0.9f;
-            // same pitch-first-then-yaw order as the particles (screen-relative pitch)
-            float y1 = s->y * cp - s->z * sp;
-            float z1 = s->y * sp + s->z * cp;
-            float xr = s->x * cr + z1 * sr;
-            float zr2 = -s->x * sr + z1 * cr;
-            float yr2 = y1;
-            float depth = 0.80f + 0.20f * zr2;
-            float px = ox + xr * escale * depth;
-            float py = oy + yr2 * escale * depth;
-            float fade = smoothstep(0, 0.2f, s->life);
-            dot_16(back, W, H, STRIDE, px, py, 2.0f + 2.0f * fade,
-                   0.5f * fade, 0.8f * fade, 1.0f * fade);
-        }
+        // Iris turns maroon while night shift is on (eased, ~1s fade either way).
+        // ns_manual/ns_running are last frame's values: at most one frame late.
+        static float night_w = 0.0f;
+        night_w += ((ns_manual || ns_running ? 1.0f : 0.0f) - night_w) * (1.0f - expf(-3.0f * dt));
+        org_frame(back, W, H, STRIDE, ox, oy, escale, global_time, dt, act,
+                  yaw, pitch, heartbeat(beat_phase), beat_phase, night_w);
 
         // --- widgets: clock + system stats + agent panel on top of the orb ---
         if (t - tstats > 1.0) { tstats = t; read_stats(&stats); read_agent_stats(&agent); read_portfolio_stats(&portfolio); ns_running = ns_running_check(); }
@@ -592,35 +461,46 @@ int main(int argc, char **argv) {
         int ns_mode = (ns_manual || ns_running);
         // The console is shown when the user tapped the job row, OR whenever
         // night-shift mode is active and we know which row is the Night shift job.
+        // (While it runs, the job can drop out of the queue list, so night-shift
+        // mode alone is enough; it must not depend on the job's row existing.)
         int ns_open = (sel_job >= 0 && strcmp(stats.names[sel_job], NS_JOB_NAME) == 0)
-                      || (ns_mode && ns_job_idx >= 0);
+                      || ns_mode;
         // Which job index the console should render for.
         int ns_console_job = (sel_job >= 0 && strcmp(stats.names[sel_job], NS_JOB_NAME) == 0)
                              ? sel_job : ns_job_idx;
 
         // Refresh the Night shift transcript ~1Hz whenever its console is open.
         if (ns_open && t - ns_last_read > 1.0) { ns_last_read = t; ns_read_transcript(&ns_con); }
-        draw_widgets(back, W, H, STRIDE, &stats, (int)(scroll_f + 0.5f), sel_job);
+
+        // --- Session orbs: draw around the main sphere (BACKGROUND layer) ---
+        read_session_stats(&sessions, t);
+        update_session_orbs(&sessions, dt);
+        draw_session_orbs(back, W, H, STRIDE, &sessions, global_time, act);
+
+        // Night shift no longer tints the whole screen or draws a top banner
+        // (that hid the clock and turned Iris red); the log panel in the left
+        // column carries the "night shift is on" signal instead.
+        float ns_pulse = 0.5f + 0.5f * sinf(global_time * 2.0f * (float)M_PI * 0.5f); // ~0.5Hz
+        int show_log = ns_open;
+
+        // --- Widgets: clock, plus the cron queue unless the night log owns the column ---
+        draw_widgets(back, W, H, STRIDE, &stats, (int)(scroll_f + 0.5f), sel_job, !show_log);
+
+        // --- Agent panel (TOP layer - clean, no tint) ---
         draw_agent_panel(back, W, H, STRIDE, &agent, ns_manual, &portfolio);
-        if (ns_open && ns_console_job >= 0) {
+
+        // --- NIGHT SHIFT trigger, top-right corner (always shown) ---
+        // STARTING shows from the tap until the run is detected (up to 60s).
+        draw_ns_run_button(back, W, H, STRIDE, ns_running,
+                           !ns_running && t - ns_fire_at < 60.0, ns_pulse);
+
+        // --- Night shift log (left column) or job detail overlay ---
+        if (show_log) {
             int firing = (t - ns_fire_at) < 2.5;   // brief RUN NOW feedback
-            draw_night_console(back, W, H, STRIDE, &stats, ns_console_job, &ns_con, firing);
+            draw_night_log(back, W, H, STRIDE, &ns_con, firing, ns_manual, ns_pulse);
         } else if (sel_job >= 0) {
             draw_job_detail(back, W, H, STRIDE, &stats, sel_job);
         }
-
-        // --- Night shift RUNNING/MANUAL ambient layer (additive; while running OR manual) ---
-        if (ns_mode) {
-            float pulse = 0.5f + 0.5f * sinf(global_time * 2.0f * (float)M_PI * 0.5f); // ~0.5Hz
-            ns_tint_red(back, W, H, STRIDE, pulse);
-            // Manual toggle shows a distinct label; the real cron job shows RUNNING.
-            const char *label = ns_manual ? "NIGHT SHIFT (MANUAL)" : "NIGHT SHIFT RUNNING";
-            draw_night_banner(back, W, H, STRIDE, pulse, label);
-        }
-
-        // --- Session orbs: draw around the main sphere ---
-        read_session_stats(&sessions);
-        draw_session_orbs(back, W, H, STRIDE, &sessions, global_time);
 
         // --- blit atomically ---
         memcpy(fb_raw, back_raw, fbsize);

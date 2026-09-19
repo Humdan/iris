@@ -10,7 +10,6 @@ Group=video
 WorkingDirectory=/home/humdan/dev/iris
 Environment=IRIS_SESSIONS_FILE=/tmp/iris_sessions.json
 ExecStartPre=/bin/sh -c 'echo idle > /tmp/iris_state; chmod 666 /tmp/iris_state; mkdir -p /tmp && touch /tmp/iris_sessions.json; chmod 666 /tmp/iris_sessions.json'
-ExecStartPre=/bin/sh -c 'python3 /home/humdan/dev/iris/session_watcher.py --watch --interval 2 &'
 ExecStart=/home/humdan/dev/iris/iris_fb /tmp/iris_state
 Restart=always
 RestartSec=3

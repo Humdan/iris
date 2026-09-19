@@ -193,6 +193,14 @@ static int ns_is_nightshift(const char *name) {
   return 0;
 }
 
+static int should_hide_job(const char *name) {
+    if (!name) return 0;
+    if (strcmp(name, "Night shift") == 0) return 1;
+    if (strstr(name, "Portfolio LCD") != NULL) return 1;
+    if (strstr(name, "LED") != NULL) return 1;  // also hide LED control jobs
+    return 0;
+}
+
 static void read_stats(FeedStats *st) {
   time_t now = time(NULL);
   struct tm *tm = localtime(&now);
@@ -225,6 +233,12 @@ static void read_stats(FeedStats *st) {
     const char *ep = strstr(idp, "\"enabled\"");
     if (ep && ep < end) { const char *c = strchr(ep, ':'); if (c && strstr(c, "false") && strstr(c, "false") < c + 8) is_enabled = 0; }
 
+    // Skip hidden jobs
+    if (should_hide_job(name)) {
+      p = end;
+      continue;
+    }
+
     strncpy(st->names[st->njobs], name, 21); st->names[st->njobs][21] = 0;
     when_label(when_iso, st->when[st->njobs], sizeof(st->when[st->njobs]));
     strncpy(st->schedule[st->njobs], sched[0] ? sched : "-", 39); st->schedule[st->njobs][39] = 0;
@@ -252,7 +266,7 @@ static void read_stats(FeedStats *st) {
 // scroll: number of jobs scrolled off the top (already clamped by caller).
 // sel:    selected job index, or -1 if none (drawn highlighted).
 static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const FeedStats *st,
-                         int scroll, int sel) {
+                         int scroll, int sel, int show_queue) {
   const float cyan_r = 0.35f, cyan_g = 0.75f, cyan_b = 0.95f;
   const float dim_r = 0.40f, dim_g = 0.45f, dim_b = 0.52f;
   const float ok_r = 0.25f, ok_g = 0.85f, ok_b = 0.45f;
@@ -263,6 +277,8 @@ static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const FeedSta
   wtext(back, W, H, STRIDE, (W - tw) / 2, 10, st->clock, 4, cyan_r, cyan_g, cyan_b);
   int dw = (int)strlen(st->date) * 6 * 2;
   wtext(back, W, H, STRIDE, (W - dw) / 2, 44, st->date, 2, dim_r, dim_g, dim_b);
+
+  if (!show_queue) return;   // night-shift log owns the left column
 
   // --- left column: cron QUEUE ---
   int lx = QUEUE_LX, ly = QUEUE_LY;
@@ -336,18 +352,19 @@ static void wfill(uint16_t *back, int W, int H, int STRIDE, int x, int y, int w,
 #define NS_BTN_X (OVL_X + OVL_W - NS_BTN_W - 12)
 #define NS_BTN_Y (OVL_Y + OVL_H - NS_BTN_H - 12)
 
-// LARGE night-shift console: dominates the screen so the live step log is the
-// focus while the shift runs. Spans the area right of the queue column, below
-// the clock, above the agent panel. 800x480 screen.
-#define NSC_X 288
-#define NSC_Y 66
-#define NSC_W 504
-#define NSC_H 366
-// RUN NOW button inside the big console (bottom-right).
-#define NSC_BTN_W 130
-#define NSC_BTN_H 38
-#define NSC_BTN_X (NSC_X + NSC_W - NSC_BTN_W - 14)
-#define NSC_BTN_Y (NSC_Y + NSC_H - NSC_BTN_H - 14)
+// Night-shift log panel: takes over the LEFT column (where the queue normally
+// is) while night shift is on, so the clock, Iris and the bottom panel stay
+// visible. Right edge stops short of the orb (its left edge is >= x=380).
+#define NSC_X 0
+#define NSC_Y 70
+#define NSC_W 374
+#define NSC_H 336          // down to y=406, just above the bottom panel
+// Manual night-shift trigger: top-right corner of the screen (clear of the
+// centered clock, which ends at x~496, and above the orb).
+#define NS_RUN_W 124
+#define NS_RUN_H 26
+#define NS_RUN_X (800 - NS_RUN_W - 8)
+#define NS_RUN_Y 8
 
 // Transcript cache: filled by ns_read_transcript() at ~1Hz, drawn every frame.
 // Sized to fill the large night-shift console panel (majority of the screen).
@@ -397,10 +414,35 @@ static int ns_newest_file(char *out, int outsz) {
 // but no live log (e.g. plugin disabled) still briefly registers. Meant to be
 // called ~1Hz off the render cadence, never per frame.
 #define NS_RUNNING_FRESH_S 25
+// The plugin brackets each run with "night shift started" / "night shift
+// finished" lines in the live log. A run is live from started until finished;
+// the silence cutoff only covers a run that died without writing "finished".
+// (Steps can be minutes apart while the model thinks, so step freshness alone
+// flickered the display back to normal mid-run.)
+#define NS_SILENCE_CUTOFF_S (30 * 60)
+static int ns_live_log_running(void) {
+  struct stat lsb;
+  if (stat(NS_LIVE_LOG, &lsb) != 0 || lsb.st_size == 0) return 0;
+  if (time(NULL) - lsb.st_mtime > NS_SILENCE_CUTOFF_S) return 0;
+  FILE *f = fopen(NS_LIVE_LOG, "r");
+  if (!f) return 0;
+  char line[512], last[512] = "";
+  int started = 0;
+  while (fgets(line, sizeof(line), f)) {
+    if (strstr(line, "night shift started")) started = 1;
+    if (line[0] && line[0] != '\n') { strncpy(last, line, sizeof(last) - 1); last[sizeof(last) - 1] = 0; }
+  }
+  fclose(f);
+  if (strstr(last, "night shift finished")) return 0;
+  // ring-trimming can drop the "started" line on long runs; recent activity
+  // with no "finished" still means it's running
+  return started || time(NULL) - lsb.st_mtime < NS_RUNNING_FRESH_S;
+}
+
 static int ns_running_check(void) {
   struct stat lsb;
   if (stat(NS_LIVE_LOG, &lsb) == 0 && lsb.st_size > 0)
-    if ((time(NULL) - lsb.st_mtime) < NS_RUNNING_FRESH_S) return 1;
+    return ns_live_log_running();
   char path[512];
   if (!ns_newest_file(path, sizeof(path))) return 0;
   struct stat sb;
@@ -412,6 +454,18 @@ static int ns_running_check(void) {
 // the iris plugin during a night-shift run (tool-by-tool progress); fall back to
 // the newest run's final report if no live log exists. Meant to be called ~1Hz
 // off the render cadence, not per frame.
+// "/home/humdan/.hermes/x" -> ".hermes/x" in place, so log lines fit the
+// narrow column (the 5x7 font has no '~' glyph to abbreviate with).
+static void ns_shorten_home(char *raw) {
+  const char *home = getenv("HOME");
+  size_t hl = home ? strlen(home) : 0;
+  if (hl < 2) return;
+  for (char *p = raw; (p = strstr(p, home)) != NULL; ) {
+    size_t cut = hl + (p[hl] == '/' ? 1 : 0);
+    memmove(p, p + cut, strlen(p + cut) + 1);
+  }
+}
+
 static void ns_read_transcript(NightConsole *nc) {
   nc->have = 0; nc->nlines = 0; nc->running = 0; nc->mtime = 0;
 
@@ -422,7 +476,7 @@ static void ns_read_transcript(NightConsole *nc) {
     if (lf) {
       nc->have = 1;
       nc->mtime = lsb.st_mtime;
-      nc->running = (time(NULL) - lsb.st_mtime) < NS_RUNNING_FRESH_S;
+      nc->running = ns_live_log_running();
       char ring[NS_MAX_LINES][NS_LINE_LEN];
       int rn = 0, rhead = 0;
       char raw[1024];
@@ -430,6 +484,7 @@ static void ns_read_transcript(NightConsole *nc) {
         size_t l = strlen(raw);
         while (l > 0 && (raw[l-1] == '\n' || raw[l-1] == '\r')) raw[--l] = 0;
         if (raw[0] == 0) continue;
+        ns_shorten_home(raw);
         char *slot = ring[rhead];
         int i = 0;
         for (const char *p = raw; *p && i < NS_LINE_LEN - 1; p++) {
@@ -474,6 +529,7 @@ static void ns_read_transcript(NightConsole *nc) {
       continue;
     }
     if (raw[0] == 0) continue;   // skip blank lines to pack the panel
+    ns_shorten_home(raw);
     // store truncated line into the ring
     char *slot = ring[rhead];
     int i = 0;
@@ -500,139 +556,104 @@ static void ns_read_transcript(NightConsole *nc) {
 // Draw the Night shift CONSOLE overlay: a LARGE panel dominating the screen with
 // the live step log as the focus, plus a status line and RUN NOW button.
 // `firing_active` = 1 while showing the brief FIRING feedback after a tap.
-static void draw_night_console(uint16_t *back, int W, int H, int STRIDE,
-                               const FeedStats *st, int sel,
-                               const NightConsole *nc, int firing_active) {
-  const float cyan_r = 0.35f, cyan_g = 0.75f, cyan_b = 0.95f;
+// Night-shift log panel in the left column: header, status, the live step log
+// (long lines wrap to the column width, newest at the bottom).
+// Top-right NIGHT SHIFT button: RUN when idle, STARTING after a tap, a pulsing
+// (non-tappable) RUNNING while a run is live.
+static void draw_ns_run_button(uint16_t *back, int W, int H, int STRIDE,
+                               int running, int starting, float pulse) {
+  const char *label; float r, g, b;
+  if (running)       { label = "RUNNING";         float k = 0.6f + 0.4f * pulse; r = 0.95f * k; g = 0.30f * k; b = 0.30f * k; }
+  else if (starting) { label = "STARTING...";     r = 0.95f; g = 0.75f; b = 0.20f; }
+  else               { label = "RUN NIGHT SHIFT"; r = 0.35f; g = 0.75f; b = 0.95f; }
+  wfill(back, W, H, STRIDE, NS_RUN_X, NS_RUN_Y, NS_RUN_W, NS_RUN_H, 0.05f, 0.07f, 0.10f);
+  for (int x = 0; x < NS_RUN_W; x++) {
+    wput(back, W, H, STRIDE, NS_RUN_X + x, NS_RUN_Y, r, g, b);
+    wput(back, W, H, STRIDE, NS_RUN_X + x, NS_RUN_Y + NS_RUN_H - 1, r, g, b);
+  }
+  for (int y = 0; y < NS_RUN_H; y++) {
+    wput(back, W, H, STRIDE, NS_RUN_X, NS_RUN_Y + y, r, g, b);
+    wput(back, W, H, STRIDE, NS_RUN_X + NS_RUN_W - 1, NS_RUN_Y + y, r, g, b);
+  }
+  int lw = (int)strlen(label) * 6;
+  wtext(back, W, H, STRIDE, NS_RUN_X + (NS_RUN_W - lw) / 2, NS_RUN_Y + 10, label, 1, r, g, b);
+}
+
+static void draw_night_log(uint16_t *back, int W, int H, int STRIDE,
+                           const NightConsole *nc, int firing_active,
+                           int ns_manual, float pulse) {
+  (void)firing_active;
   const float dim_r = 0.55f, dim_g = 0.60f, dim_b = 0.68f;
   const float log_r = 0.55f, log_g = 0.85f, log_b = 0.70f;   // live-log green tint
   const float ok_r = 0.25f, ok_g = 0.85f, ok_b = 0.45f;
+  const float red_r = 0.95f, red_g = 0.30f, red_b = 0.30f;
 
-  // large panel background + border
-  wfill(back, W, H, STRIDE, NSC_X, NSC_Y, NSC_W, NSC_H, 0.03f, 0.06f, 0.09f);
-  for (int x = 0; x < NSC_W; x++) {
-    if (x < 6 || x > NSC_W - 7) continue;
-    wput(back, W, H, STRIDE, NSC_X + x, NSC_Y, cyan_r, cyan_g, cyan_b);
-    wput(back, W, H, STRIDE, NSC_X + x, NSC_Y + NSC_H - 1, cyan_r, cyan_g, cyan_b);
-  }
-  for (int y = 0; y < NSC_H; y++) {
-    if (y < 6 || y > NSC_H - 7) continue;
-    wput(back, W, H, STRIDE, NSC_X, NSC_Y + y, cyan_r, cyan_g, cyan_b);
-    wput(back, W, H, STRIDE, NSC_X + NSC_W - 1, NSC_Y + y, cyan_r, cyan_g, cyan_b);
-  }
+  int px = NSC_X + 12, py = NSC_Y + 12;
+  // pulsing red accent bar down the left edge = "night shift is on"
+  float pk = 0.55f + 0.45f * pulse;
+  wfill(back, W, H, STRIDE, NSC_X + 2, NSC_Y + 4, 3, NSC_H - 8, red_r * pk, red_g * pk, red_b * pk);
 
-  int px = NSC_X + 16, py = NSC_Y + 12;
-  // title
-  wtext(back, W, H, STRIDE, px, py, st->names[sel], 2, cyan_r, cyan_g, cyan_b);
-
-  // status line: running vs idle+last-run time
+  wtext(back, W, H, STRIDE, px, py, "NIGHT SHIFT", 2, red_r * pk, red_g * pk, red_b * pk);
   {
     char sbuf[48];
     float sr, sg, sb;
     if (firing_active) { snprintf(sbuf, sizeof(sbuf), "FIRING..."); sr=0.95f; sg=0.75f; sb=0.20f; }
+    else if (nc->running) { snprintf(sbuf, sizeof(sbuf), "RUNNING"); sr=ok_r; sg=ok_g; sb=ok_b; }
     else if (!nc->have) { snprintf(sbuf, sizeof(sbuf), "NO RUNS YET"); sr=dim_r; sg=dim_g; sb=dim_b; }
-    else if (nc->running) { snprintf(sbuf, sizeof(sbuf), "RUNNING..."); sr=ok_r; sg=ok_g; sb=ok_b; }
     else {
       time_t d = time(NULL) - nc->mtime;
-      if (d < 60) snprintf(sbuf, sizeof(sbuf), "IDLE - %lldS AGO", (long long)d);
-      else if (d < 3600) snprintf(sbuf, sizeof(sbuf), "IDLE - %lldM AGO", (long long)(d/60));
-      else if (d < 86400) snprintf(sbuf, sizeof(sbuf), "IDLE - %lldH AGO", (long long)(d/3600));
-      else snprintf(sbuf, sizeof(sbuf), "IDLE - %lldD AGO", (long long)(d/86400));
+      if (d < 60) snprintf(sbuf, sizeof(sbuf), "IDLE - LAST %lldS AGO", (long long)d);
+      else if (d < 3600) snprintf(sbuf, sizeof(sbuf), "IDLE - LAST %lldM AGO", (long long)(d/60));
+      else if (d < 86400) snprintf(sbuf, sizeof(sbuf), "IDLE - LAST %lldH AGO", (long long)(d/3600));
+      else snprintf(sbuf, sizeof(sbuf), "IDLE - LAST %lldD AGO", (long long)(d/86400));
       sr=dim_r; sg=dim_g; sb=dim_b;
     }
-    wtext(back, W, H, STRIDE, px + 12 * 6 * 2, py + 2, sbuf, 1, sr, sg, sb);
+    int sx = px + 11 * 12 + 12;          // right of the "NIGHT SHIFT" title
+    wtext(back, W, H, STRIDE, sx, py + 4, sbuf, 1, sr, sg, sb);
+    if (ns_manual) wtext(back, W, H, STRIDE, sx, py + 14, "MANUAL MODE", 1, red_r, red_g, red_b);
   }
 
-  // "LIVE LOG" header + separator; the log itself gets the rest of the panel.
-  int cy = py + 26;
-  wtext(back, W, H, STRIDE, px, cy, "LIVE LOG", 1, cyan_r, cyan_g, cyan_b);
-  cy += 14;
-  for (int x = px; x < NSC_X + NSC_W - 16; x++) wput(back, W, H, STRIDE, x, cy, 0.14f, 0.18f, 0.22f);
-  cy += 6;
+  int cy = py + 28;
+  for (int x = px; x < NSC_X + NSC_W - 8; x++) wput(back, W, H, STRIDE, x, cy, 0.14f, 0.18f, 0.22f);
+  int ty = cy + 6;
 
-  // transcript area — the live step log tail; fills down to the button row.
-  int ty = cy;
-  int line_h = 11;   // scale-1 glyph is 7px tall + gap
+  const int line_h = 11;                       // scale-1 glyph is 7px tall + gap
+  const int wrap = (NSC_X + NSC_W - 8 - px) / 6; // chars per row
+  int rows = (NSC_Y + NSC_H - 4 - ty) / line_h;
   if (!nc->have || nc->nlines == 0) {
-    wtext(back, W, H, STRIDE, px, ty, nc->have ? "(NO STEPS YET)" : "NO RUNS YET",
-          1, dim_r, dim_g, dim_b);
+    wtext(back, W, H, STRIDE, px, ty, nc->have ? "(NO STEPS YET)" : "NO RUNS YET", 1, dim_r, dim_g, dim_b);
   } else {
-    // how many lines fit above the button row
-    int avail = (NSC_BTN_Y - 8 - ty) / line_h;
-    if (avail > nc->nlines) avail = nc->nlines;
-    if (avail > NS_MAX_LINES) avail = NS_MAX_LINES;
-    int first = nc->nlines - avail; if (first < 0) first = 0;
-    for (int k = 0; k < avail; k++) {
-      wtext(back, W, H, STRIDE, px, ty + k * line_h, nc->lines[first + k], 1,
-            log_r, log_g, log_b);
+    // walk back from the newest line until the column is full
+    int first = nc->nlines, used = 0, skip = 0;
+    while (first > 0) {
+      int len = (int)strlen(nc->lines[first - 1]);
+      int n = len ? (len + wrap - 1) / wrap : 1;
+      if (used + n > rows) {                 // only the tail of this line fits
+        if (rows - used > 0) { skip = used + n - rows; first--; used = rows; }
+        break;
+      }
+      used += n; first--;
     }
-  }
-
-  // RUN NOW button (bottom-right of the big console), bordered rectangle
-  {
-    float br = firing_active ? 0.95f : cyan_r;
-    float bg = firing_active ? 0.75f : cyan_g;
-    float bb = firing_active ? 0.20f : cyan_b;
-    // fill
-    wfill(back, W, H, STRIDE, NSC_BTN_X, NSC_BTN_Y, NSC_BTN_W, NSC_BTN_H,
-          0.08f, 0.12f, 0.16f);
-    // border
-    for (int x = 0; x < NSC_BTN_W; x++) {
-      wput(back, W, H, STRIDE, NSC_BTN_X + x, NSC_BTN_Y, br, bg, bb);
-      wput(back, W, H, STRIDE, NSC_BTN_X + x, NSC_BTN_Y + NSC_BTN_H - 1, br, bg, bb);
-    }
-    for (int y = 0; y < NSC_BTN_H; y++) {
-      wput(back, W, H, STRIDE, NSC_BTN_X, NSC_BTN_Y + y, br, bg, bb);
-      wput(back, W, H, STRIDE, NSC_BTN_X + NSC_BTN_W - 1, NSC_BTN_Y + y, br, bg, bb);
-    }
-    const char *label = firing_active ? "FIRING" : "RUN NOW";
-    int lw = (int)strlen(label) * 6 * 2;
-    wtext(back, W, H, STRIDE, NSC_BTN_X + (NSC_BTN_W - lw) / 2, NSC_BTN_Y + 12,
-          label, 2, br, bg, bb);
-  }
-}
-
-// --- Night shift RUNNING ambient indicator (additive; drawn only while running) ---
-// Red-tint the ENTIRE back buffer in one pass. RGB565 decode -> tint -> re-encode.
-// `pulse` is 0..1 (gentle sine) so the wash breathes; kept subtle so the sphere,
-// widgets and overlays stay readable. Called at most once per frame, only while
-// the night shift is running (skipped entirely when idle => zero cost).
-static void ns_tint_red(uint16_t *back, int W, int H, int STRIDE, float pulse) {
-  // wash strength: base + small pulse. R lifted, G/B slightly damped.
-  const float rk = 0.10f + 0.05f * pulse;   // add to red
-  const float dk = 0.88f - 0.04f * pulse;   // multiply g/b (dim toward red mood)
-  const int spx = STRIDE / 2;
-  for (int y = 0; y < H; y++) {
-    uint16_t *row = back + y * spx;
-    for (int x = 0; x < W; x++) {
-      uint16_t px = row[x];
-      int r5 = (px >> 11) & 0x1F;
-      int g6 = (px >> 5) & 0x3F;
-      int b5 = px & 0x1F;
-      int nr = (int)(r5 + rk * 31.0f);      if (nr > 31) nr = 31;
-      int ng = (int)(g6 * dk);              if (ng > 63) ng = 63;
-      int nb = (int)(b5 * dk);              if (nb > 31) nb = 31;
-      row[x] = (uint16_t)((nr << 11) | (ng << 5) | nb);
+    int row = 0;
+    for (int k = first; k < nc->nlines && row < rows; k++) {
+      const char *ln = nc->lines[k];
+      int len = (int)strlen(ln);
+      int n = len ? (len + wrap - 1) / wrap : 1;
+      for (int part = (k == first ? skip : 0); part < n && row < rows; part++, row++) {
+        char seg[128];
+        int off = part * wrap, cnt = len - off < wrap ? len - off : wrap;
+        if (cnt < 0) cnt = 0;
+        if (cnt > (int)sizeof(seg) - 1) cnt = sizeof(seg) - 1;
+        memcpy(seg, ln + off, cnt); seg[cnt] = 0;
+        // continuation rows are indented so wrapped steps read as one item
+        wtext(back, W, H, STRIDE, px + (part ? 12 : 0), ty + row * line_h, seg, 1, log_r, log_g, log_b);
+      }
     }
   }
 }
 
 // Full-width top banner: a stronger red bar with centered white label. Sits at the
 // very top strip; `pulse` (0..1) gently modulates the bar brightness so it reads live.
-#define NS_BANNER_H 32
-static void draw_night_banner(uint16_t *back, int W, int H, int STRIDE, float pulse, const char *label) {
-  float br = 0.55f + 0.20f * pulse;   // bar red
-  wfill(back, W, H, STRIDE, 0, 0, W, NS_BANNER_H, br, 0.05f, 0.06f);
-  // thin bright underline for definition
-  wfill(back, W, H, STRIDE, 0, NS_BANNER_H - 2, W, 2, 0.95f, 0.35f, 0.35f);
-  if (!label) label = "NIGHT SHIFT RUNNING";
-  int scale = 3;
-  int tw = (int)strlen(label) * 6 * scale;   // wtext advance = 6px/char * scale
-  int tx = (W - tw) / 2;
-  int ty = (NS_BANNER_H - 7 * scale) / 2;
-  float lw = 0.95f + 0.05f * pulse;
-  wtext(back, W, H, STRIDE, tx, ty, label, scale, lw, lw, lw);
-}
 
 static void draw_job_detail(uint16_t *back, int W, int H, int STRIDE, const FeedStats *st, int sel) {
   if (sel < 0 || sel >= st->njobs) return;
@@ -666,7 +687,10 @@ static void draw_job_detail(uint16_t *back, int W, int H, int STRIDE, const Feed
 
   py += 44;
   wtext(back, W, H, STRIDE, px, py, "SCHEDULE", 1, lbl_r, lbl_g, lbl_b);
-  wtext(back, W, H, STRIDE, px, py + 12, st->schedule[sel], 2, dim_r, dim_g, dim_b);
+  {
+    int sc = (int)strlen(st->schedule[sel]) * 12 <= OVL_W - 36 ? 2 : 1;
+    wtext(back, W, H, STRIDE, px, py + 12, st->schedule[sel], sc, dim_r, dim_g, dim_b);
+  }
 
   py += 44;
   wtext(back, W, H, STRIDE, px, py, "LAST STATUS", 1, lbl_r, lbl_g, lbl_b);
@@ -782,15 +806,24 @@ static void read_agent_stats(AgentStats *a) {
 // cheaply (~1Hz, same cadence as AgentStats). The cache is written by a small
 // wrapper script (see scripts/portfolio-cache.sh) that shells ledger.py status
 // -- keeps the render loop free of subprocess spawns. Format (one line,
-// pipe-delimited, all it needs): "<total_value>|<pnl_pct>".
+// pipe-delimited): "<total_value>|<pnl_pct>|<crypto_symbol>|<crypto_qty>|<crypto_value>|<crypto_pnl_pct>".
 typedef struct {
   int have;         // 1 if cache file present and parsed
   float total;       // total portfolio value in USD
   float pnl_pct;      // % change since $1000 start
+  // Crypto fields (optional, only present if holding crypto)
+  char crypto_symbol[16];  // e.g., "X:BTC"
+  float crypto_qty;        // quantity held
+  float crypto_value;      // USD value
+  float crypto_pnl_pct;    // % P&L on crypto position
 } PortfolioStats;
 
 
 // ---- Session orbs: one orb per open Hermes session ----
+// All motion is integrated per frame (update_session_orbs) and every visual
+// property is eased, so nothing ever jumps: a session appearing fades in, one
+// closing fades out, and a session becoming/ceasing to be "primary" smoothly
+// changes speed, size and brightness instead of teleporting to a new angle.
 #define SESSION_MAX 32
 #define SESSION_FILE "/tmp/iris_sessions.json"
 
@@ -800,169 +833,193 @@ typedef struct {
   char source[16];       // "cli", "telegram", "cron"
   char color[16];        // "cyan", "magenta", "amber"
   char session_id[64];   // unique session ID from JSON for stable matching
-  int is_primary;        // 1 for most recent session
+  int is_primary;        // 1 for most recent session (target; `prim` eases to it)
+  int alive;             // still listed by the watcher; 0 = fading out
   float idle_seconds;
-  float orbit_angle;     // current orbital angle for smooth motion
+  float orbit_angle;     // integrated each frame
   float orbit_radius;    // distance from center
   float pulse_phase;     // individual pulse phase
+  float vis;             // 0..1 fade in/out
+  float prim;            // 0..1 eased primary weight
+  float idle_dim;        // eased idle brightness factor
 } SessionOrb;
 
 typedef struct {
   int count;
   SessionOrb orbs[SESSION_MAX];
-  time_t last_read;
+  double last_read;
 } SessionStats;
 
-static void read_session_stats(SessionStats *s) {
-  // Only re-read every ~2 seconds
-  time_t now = time(NULL);
-  if (s->count > 0 && now - s->last_read < 2) return;
+// Stable pseudo-random value in [0,1) from a session id, so a new orb always
+// spawns at the same place for the same session (no clumping at one angle).
+static float session_hash01(const char *s) {
+  uint32_t h = 2166136261u;
+  while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+  return (h & 0xFFFFFF) / (float)0x1000000;
+}
 
+static void json_copy_str(const char *obj_start, const char *obj_end, const char *key,
+                          char *out, int outsz) {
+  out[0] = 0;
+  const char *v = json_find(obj_start, key, obj_end);
+  if (!v) return;
+  while (*v == ' ') v++;
+  if (*v != '"') return;           // null / non-string
+  v++;
+  int i = 0;
+  while (*v && *v != '"' && v < obj_end && i < outsz - 1) out[i++] = *v++;
+  out[i] = 0;
+}
+
+static void read_session_stats(SessionStats *s, double t) {
+  if (s->last_read != 0 && t - s->last_read < 2.0) return;   // ~0.5 Hz, even when empty
+  s->last_read = t;
+
+  static char buf[16384];
   FILE *f = fopen(SESSION_FILE, "r");
-  if (!f) { s->count = 0; return; }
-
-  static char buf[8192];
-  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+  size_t n = 0;
+  if (f) { n = fread(buf, 1, sizeof(buf) - 1, f); fclose(f); }
   buf[n] = 0;
-  fclose(f);
 
-  // Quick validity check - must have sessions array
-  if (!strstr(buf, "\"sessions\"")) { s->count = 0; return; }
+  const char *p = f ? strstr(buf, "\"sessions\"") : NULL;
+  if (f && !p) return;             // unreadable/partial: keep what we have
+  if (p) p = strchr(p, '[');
+  if (f && !p) return;
 
-  // Parse new session list
-  SessionOrb new_orbs[SESSION_MAX];
-  int new_count = 0;
-  const char *p = strstr(buf, "\"sessions\"");
-  if (!p) { s->count = 0; return; }
-  p = strchr(p, '[');
-  if (!p) { s->count = 0; return; }
+  // Mark everything dead; entries still listed are revived below.
+  for (int i = 0; i < s->count; i++) s->orbs[i].alive = 0;
+  if (!p) return;                  // watcher file gone: everything fades out
 
-  p++; // skip '['
-  while (*p && new_count < SESSION_MAX) {
-    while (*p && *p != '{') p++;
-    if (!*p) break;
+  int rank = 0;
+  p++;
+  while (*p && *p != ']') {
+    while (*p && *p != '{' && *p != ']') p++;
+    if (*p != '{') break;
     const char *obj_start = p;
     int brace = 0;
     while (*p) {
       if (*p == '{') brace++;
-      else if (*p == '}') {
-        brace--;
-        if (brace == 0) { p++; break; }
-      }
+      else if (*p == '}' && --brace == 0) { p++; break; }
       p++;
     }
     const char *obj_end = p;
 
-    SessionOrb *orb = &new_orbs[new_count];
-    memset(orb, 0, sizeof(*orb));
+    char id[64];
+    json_copy_str(obj_start, obj_end, "id", id, sizeof(id));
+    if (!id[0]) continue;
 
-    const char *v;
-    char session_id[64] = {0};
-    if ((v = json_find(obj_start, "id", obj_end))) {
-      const char *q = strchr(v, '"');
-      if (q) { q++; int i = 0; while (*q && *q != '"' && i < 63) session_id[i++] = *q++; session_id[i] = 0; }
+    SessionOrb *orb = NULL;
+    for (int i = 0; i < s->count; i++)
+      if (strcmp(s->orbs[i].session_id, id) == 0) { orb = &s->orbs[i]; break; }
+    if (!orb) {
+      if (s->count >= SESSION_MAX) { rank++; continue; }
+      orb = &s->orbs[s->count++];
+      memset(orb, 0, sizeof(*orb));
+      strncpy(orb->session_id, id, sizeof(orb->session_id) - 1);
+      float h = session_hash01(id);
+      orb->orbit_angle = h * 6.2831853f;
+      orb->orbit_radius = 170.0f + (float)((int)(h * 997.0f) % 3) * 15.0f;
+      orb->pulse_phase = h * 17.0f;
+      orb->vis = 0.0f;
+      orb->idle_dim = 1.0f;
     }
-    if ((v = json_find(obj_start, "label", obj_end))) {
-      const char *q = strchr(v, '"');
-      if (q) { q++; int i = 0; while (*q && *q != '"' && i < 23) orb->label[i++] = *q++; orb->label[i] = 0; }
-    }
-    // Decode common escaped Unicode in label (e.g., \ud83d\udcc1 -> 📁)
-    for (char *p = orb->label; *p; p++) {
-      if (p[0] == '\\' && p[1] == 'u' && p[6] == '\\' && p[7] == 'u') {
-        // Surrogate pair \uD83D\uDCC1 -> 📁
-        // Just replace with a simple marker since we can't render full UTF-8 in 5x7 font
-        memmove(p + 1, p + 12, strlen(p + 12) + 1);
-        p[0] = 'F'; // folder marker
+    orb->alive = 1;
+    orb->is_primary = (rank == 0);
+
+    json_copy_str(obj_start, obj_end, "label", orb->label, sizeof(orb->label));
+    // Escaped emoji (📁 etc.) can't be drawn by the 5x7 font: drop
+    // the escape sequences and any following space.
+    {
+      char clean[24]; int j = 0;
+      for (const char *q = orb->label; *q && j < 23; ) {
+        if (q[0] == '\\' && q[1] == 'u') {
+          int k = 2; while (k < 6 && q[k]) k++;
+          q += k;
+          continue;
+        }
+        if (j == 0 && *q == ' ') { q++; continue; }
+        clean[j++] = *q++;
       }
+      clean[j] = 0;
+      memcpy(orb->label, clean, j + 1);
     }
-    // Store session_id for stable matching across reads
-    strncpy(orb->session_id, session_id, sizeof(orb->session_id) - 1);
-    orb->session_id[sizeof(orb->session_id) - 1] = 0;
-    // Create short label (max 7 chars) for display
-    orb->short_label[0] = 0;
-    if (orb->label[0]) {
-      int src = 0;
-      // Skip folder marker we inserted
-      if (orb->label[0] == 'F' && orb->label[1] == ' ') src = 2;
-      for (int k = 0; k < 7 && orb->label[src + k]; k++) orb->short_label[k] = orb->label[src + k];
-      orb->short_label[7] = 0;
-    }
+    json_copy_str(obj_start, obj_end, "source", orb->source, sizeof(orb->source));
+    json_copy_str(obj_start, obj_end, "color", orb->color, sizeof(orb->color));
+    const char *v = json_find(obj_start, "idle_seconds", obj_end);
+    orb->idle_seconds = v ? strtof(v, NULL) : 0.0f;
+
+    int k = 0;
+    for (; k < 7 && orb->label[k]; k++) orb->short_label[k] = orb->label[k];
+    orb->short_label[k] = 0;
     if (!orb->short_label[0]) {
-      // Fallback to source initial
       orb->short_label[0] = orb->source[0] ? orb->source[0] : '?';
       orb->short_label[1] = 0;
     }
-    if ((v = json_find(obj_start, "source", obj_end))) {
-      const char *q = strchr(v, '"');
-      if (q) { q++; int i = 0; while (*q && *q != '"' && i < 15) orb->source[i++] = *q++; orb->source[i] = 0; }
-    }
-    if ((v = json_find(obj_start, "color", obj_end))) {
-      const char *q = strchr(v, '"');
-      if (q) { q++; int i = 0; while (*q && *q != '"' && i < 15) orb->color[i++] = *q++; orb->color[i] = 0; }
-    }
-    if ((v = json_find(obj_start, "idle_seconds", obj_end))) {
-      orb->idle_seconds = strtof(v, NULL);
-    }
-    // is_primary is implied by position (first = primary)
-    orb->is_primary = (new_count == 0);
-
-    // Initialize orbital parameters ONLY for new orbs (not seen before)
-    // Match by session_id to preserve orbital state across reads
-    int found = 0;
-    for (int i = 0; i < s->count; i++) {
-      if (s->orbs[i].session_id[0] && strcmp(s->orbs[i].session_id, session_id) == 0) {
-        // Preserve existing orbital state
-        orb->orbit_angle = s->orbs[i].orbit_angle;
-        orb->orbit_radius = s->orbs[i].orbit_radius;
-        orb->pulse_phase = s->orbs[i].pulse_phase;
-        found = 1;
-        break;
-      }
-    }
-    if (!found) {
-      // New orb: initialize orbital parameters
-      float base_angle = (new_count * 2.0f * 3.14159f / (new_count > 0 ? new_count : 1)) - 3.14159f / 2.0f;
-      orb->orbit_angle = base_angle;
-      orb->orbit_radius = 140.0f + (new_count % 3) * 20.0f;
-      orb->pulse_phase = new_count * 0.7f;
-    }
-
-    while (*p && *p != '{') p++;
-    new_count++;
+    rank++;
   }
-
-  // Commit new orb list (preserves orbital state for matching sessions)
-  memcpy(s->orbs, new_orbs, sizeof(SessionOrb) * new_count);
-  s->count = new_count;
-  s->last_read = now;
 }
 
+// Advance orbits and ease fades once per frame. Drops fully faded dead orbs.
+static void update_session_orbs(SessionStats *s, float dt) {
+  float k_vis  = 1.0f - expf(-2.5f * dt);
+  float k_prim = 1.0f - expf(-1.5f * dt);
+  int out = 0;
+  for (int i = 0; i < s->count; i++) {
+    SessionOrb *o = &s->orbs[i];
+    o->vis  += ((o->alive ? 1.0f : 0.0f) - o->vis) * k_vis;
+    o->prim += ((o->is_primary && o->alive ? 1.0f : 0.0f) - o->prim) * k_prim;
+    // continuous idle dimming: 1.0 when fresh, eases to 0.4 after ~10 min idle
+    float idle_target = 1.0f - 0.6f * clampf(o->idle_seconds / 600.0f, 0, 1);
+    o->idle_dim += (idle_target - o->idle_dim) * k_prim;
+    o->orbit_angle += (0.06f + 0.06f * o->prim) * dt;
+    if (o->orbit_angle > 6.2831853f) o->orbit_angle -= 6.2831853f;
+    if (!o->alive && o->vis < 0.01f) continue;   // fully faded out: drop
+    if (out != i) s->orbs[out] = *o;
+    out++;
+  }
+  s->count = out;
+}
+
+static void orb_blend(uint16_t *row, int x, float r, float g, float b) {
+  uint16_t px_val = row[x];
+  uint16_t cr = (px_val >> 11) & 0x1F;
+  uint16_t cg = (px_val >> 5) & 0x3F;
+  uint16_t cb = px_val & 0x1F;
+  uint16_t rv = (uint16_t)(clampf(r, 0, 1) * 31.0f);
+  uint16_t gv = (uint16_t)(clampf(g, 0, 1) * 63.0f);
+  uint16_t bv = (uint16_t)(clampf(b, 0, 1) * 31.0f);
+  cr = (cr + rv) > 0x1F ? 0x1F : cr + rv;
+  cg = (cg + gv) > 0x3F ? 0x3F : cg + gv;
+  cb = (cb + bv) > 0x1F ? 0x1F : cb + bv;
+  row[x] = (cr << 11) | (cg << 5) | cb;
+}
+
+static void orb_dot(uint16_t *back, int W, int H, int STRIDE, float px, float py,
+                    float rad, float r, float g, float b) {
+  int x0 = (int)(px - rad), x1 = (int)(px + rad + 1);
+  int y0 = (int)(py - rad), y1 = (int)(py + rad + 1);
+  float inv = 1.0f / (rad * rad + 0.1f);
+  for (int y = y0; y <= y1; y++) {
+    if (y < 0 || y >= H) continue;
+    uint16_t *row = back + y * (STRIDE / 2);
+    for (int x = x0; x <= x1; x++) {
+      if (x < 0 || x >= W) continue;
+      float dx = x - px, dy = y - py, d2 = (dx * dx + dy * dy) * inv;
+      if (d2 > 1.0f) continue;
+      float k = (1.0f - d2); k *= k;
+      orb_blend(row, x, r * k, g * k, b * k);
+    }
+  }
+}
+
+// `act` is the renderer's smoothed activity level (0..1), so connection lines
+// fade with the same easing as the main sphere instead of popping on raw reads.
 static void draw_session_orbs(uint16_t *back, int W, int H, int STRIDE,
-                              const SessionStats *s, float global_time) {
+                              const SessionStats *s, float global_time, float act) {
   if (s->count == 0) return;
 
-  // Read activity level (0..1) from Hermes state file
-  float act = 0.0f;
-  FILE *sf = fopen("/tmp/iris_state", "r");
-  if (sf) {
-    char buf[64] = {0};
-    if (fgets(buf, 63, sf)) {
-      if (strncmp(buf, "thinking", 8) == 0) act = 1.0f;
-      else if (strncmp(buf, "idle", 4) == 0) act = 0.0f;
-      else {
-        char *end;
-        float x = strtof(buf, &end);
-        if (end != buf) act = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
-      }
-    }
-    fclose(sf);
-  }
+  float cx = 575.0f, cy = 214.0f;  // matches orb center in iris_fb.c
 
-  // Draw orbs around the main sphere area
-  // Position them in a ring around the sphere center
-  float cx = 560.0f, cy = 240.0f;  // matches orb center in iris_fb.c
-
-  // Pre-compute orb positions and colors for connection drawing
   #define MAX_ORBS 16
   int orb_count = s->count;
   if (orb_count > MAX_ORBS) orb_count = MAX_ORBS;
@@ -972,157 +1029,64 @@ static void draw_session_orbs(uint16_t *back, int W, int H, int STRIDE,
 
   for (int i = 0; i < orb_count; i++) {
     const SessionOrb *orb = &s->orbs[i];
+    orb_x[i] = cx + cosf(orb->orbit_angle) * orb->orbit_radius;
+    orb_y[i] = cy + sinf(orb->orbit_angle) * orb->orbit_radius * 0.85f;  // max 170px: clears top + panel
 
-    // Orbital motion - primary moves faster, others slower
-    float orbit_speed = orb->is_primary ? 0.12f : 0.06f;
-    float cur_angle = orb->orbit_angle + global_time * orbit_speed;
+    float pulse = (1.0f + 0.25f * sinf(global_time * 1.5f + orb->pulse_phase)) * (1.0f + 0.2f * orb->prim);
+    orb_rad[i] = 4.0f * pulse * (0.5f + 0.5f * orb->vis);
 
-    float px = cx + cosf(cur_angle) * orb->orbit_radius;
-    float py = cy + sinf(cur_angle) * orb->orbit_radius;
-
-    // Pulsing size - smoother with individual phase
-    float pulse = 1.0f + 0.25f * sinf(global_time * 1.5f + orb->pulse_phase);
-    if (orb->is_primary) pulse *= 1.2f;
-    float rad = 4.0f * pulse;  // Slightly smaller, cleaner
-
-    // Color based on source
     float r = 0.2f, g = 0.8f, b = 1.0f; // default cyan
     if (strcmp(orb->color, "magenta") == 0) { r = 1.0f; g = 0.4f; b = 0.8f; }
     else if (strcmp(orb->color, "amber") == 0) { r = 1.0f; g = 0.7f; b = 0.2f; }
 
-    // Brightness - primary is brighter, idle sessions dimmer
-    float idle_factor = orb->idle_seconds > 300 ? 0.4f : (orb->idle_seconds > 60 ? 0.7f : 1.0f);
-    float bright = orb->is_primary ? 1.0f : 0.65f;
-    bright *= idle_factor;
-    r *= bright; g *= bright; b *= bright;
-
-    orb_x[i] = px;
-    orb_y[i] = py;
-    orb_r[i] = r;
-    orb_g[i] = g;
-    orb_b[i] = b;
-    orb_rad[i] = rad;
+    float bright = (0.65f + 0.35f * orb->prim) * orb->idle_dim * orb->vis;
+    orb_r[i] = r * bright; orb_g[i] = g * bright; orb_b[i] = b * bright;
   }
 
-  // Draw connections (knowledge graph) between orbs of same source when agents are working
-  if (act > 0.1f) {
+  // Connections (knowledge graph) between nearby orbs of the same source,
+  // faded in by activity.
+  if (act > 0.02f) {
     for (int i = 0; i < orb_count; i++) {
       for (int j = i + 1; j < orb_count; j++) {
-        // Check if same source (color string)
-        const SessionOrb *orb_i = &s->orbs[i];
-        const SessionOrb *orb_j = &s->orbs[j];
-        if (strcmp(orb_i->color, orb_j->color) != 0) continue;
-
-        float dx = orb_x[j] - orb_x[i];
-        float dy = orb_y[j] - orb_y[i];
-        float dist = sqrtf(dx*dx + dy*dy);
-        if (dist > 120.0f) continue; // only connect nearby orbs
-
-        // Line intensity based on activity and a subtle pulse
-        float base_intensity = act * 0.6f;
+        if (strcmp(s->orbs[i].color, s->orbs[j].color) != 0) continue;
+        float dx = orb_x[j] - orb_x[i], dy = orb_y[j] - orb_y[i];
+        float dist = sqrtf(dx * dx + dy * dy);
+        // soft distance falloff instead of a hard 120px cutoff (no flicker at the edge)
+        float near = 1.0f - clampf((dist - 100.0f) / 40.0f, 0, 1);
+        if (near <= 0.0f) continue;
         float pulse = 0.5f + 0.5f * sinf(global_time * 2.0f + (i + j) * 0.13f);
-        float intensity = base_intensity * pulse;
-        if (intensity <= 0.0f) continue;
-
-        // Derive line color from orb color (same for both ends)
-        float lr = orb_r[i];
-        float lg = orb_g[i];
-        float lb = orb_b[i];
-        // Scale by intensity
-        lr *= intensity; lg *= intensity; lb *= intensity;
-
-        // Draw line using simple DDS algorithm with additive blending
-        int steps = (int)dist;
-        if (steps < 1) steps = 1;
+        float intensity = act * 0.6f * pulse * near;
+        float lr = orb_r[i] * intensity, lg = orb_g[i] * intensity, lb = orb_b[i] * intensity;
+        int steps = (int)dist; if (steps < 1) steps = 1;
         for (int k = 0; k <= steps; k++) {
           float t = (float)k / (float)steps;
-          float x = orb_x[i] + dx * t;
-          float y = orb_y[i] + dy * t;
-          // Draw a small dot (radius 1) for thickness
-          int x0 = (int)(x - 1), x1 = (int)(x + 1 + 1);
-          int y0 = (int)(y - 1), y1 = (int)(y + 1 + 1);
-          float inv = 1.0f / (1.0f * 1.0f + 0.1f);
-          for (int yy = y0; yy <= y1; yy++) {
-            if (yy < 0 || yy >= H) continue;
-            uint16_t *row = back + yy * (STRIDE / 2);
-            for (int xx = x0; xx <= x1; xx++) {
-              if (xx < 0 || xx >= W) continue;
-              float dx2 = xx - x, dy2 = yy - y, d2 = (dx2*dx2 + dy2*dy2) * inv;
-              if (d2 > 1.0f) continue;
-              float kk = (1.0f - d2); kk *= kk;
-              uint16_t px_val = row[xx];
-              uint16_t cr = (px_val >> 11) & 0x1F;
-              uint16_t cg = (px_val >> 5) & 0x3F;
-              uint16_t cb = px_val & 0x1F;
-              uint16_t rv = (uint16_t)(clampf(lr * kk, 0, 1) * 31.0f);
-              uint16_t gv = (uint16_t)(clampf(lg * kk, 0, 1) * 63.0f);
-              uint16_t bv = (uint16_t)(clampf(lb * kk, 0, 1) * 31.0f);
-              cr = (cr + rv) > 0x1F ? 0x1F : cr + rv;
-              cg = (cg + gv) > 0x3F ? 0x3F : cg + gv;
-              cb = (cb + bv) > 0x1F ? 0x1F : cb + bv;
-              row[xx] = (cr << 11) | (cg << 5) | cb;
-            }
-          }
+          orb_dot(back, W, H, STRIDE, orb_x[i] + dx * t, orb_y[i] + dy * t, 1.0f, lr, lg, lb);
         }
       }
     }
   }
 
-  // Second pass: draw the orbs themselves (clean, no connections)
   for (int i = 0; i < orb_count; i++) {
     const SessionOrb *orb = &s->orbs[i];
+    float px = orb_x[i], py = orb_y[i], rad = orb_rad[i];
+    orb_dot(back, W, H, STRIDE, px, py, rad, orb_r[i], orb_g[i], orb_b[i]);
 
-    float px = orb_x[i];
-    float py = orb_y[i];
-    float rad = orb_rad[i];
-    float r = orb_r[i];
-    float g = orb_g[i];
-    float b = orb_b[i];
-
-    // Draw filled circle with additive blending (like particles)
-    int x0 = (int)(px - rad), x1 = (int)(px + rad + 1);
-    int y0 = (int)(py - rad), y1 = (int)(py + rad + 1);
-    float inv = 1.0f / (rad * rad + 0.1f);
-    for (int y = y0; y <= y1; y++) {
-      if (y < 0 || y >= H) continue;
-      uint16_t *row = back + y * (STRIDE / 2);
-      for (int x = x0; x <= x1; x++) {
-        if (x < 0 || x >= W) continue;
-        float dx = x - px, dy = y - py, d2 = (dx * dx + dy * dy) * inv;
-        if (d2 > 1.0f) continue;
-        float k = (1.0f - d2); k *= k;
-        // Additive blend onto existing pixel
-        uint16_t px_val = row[x];
-        uint16_t cr = (px_val >> 11) & 0x1F;
-        uint16_t cg = (px_val >> 5) & 0x3F;
-        uint16_t cb = px_val & 0x1F;
-        uint16_t rv = (uint16_t)(clampf(r * k, 0, 1) * 31.0f);
-        uint16_t gv = (uint16_t)(clampf(g * k, 0, 1) * 63.0f);
-        uint16_t bv = (uint16_t)(clampf(b * k, 0, 1) * 31.0f);
-        cr = (cr + rv) > 0x1F ? 0x1F : cr + rv;
-        cg = (cg + gv) > 0x3F ? 0x3F : cg + gv;
-        cb = (cb + bv) > 0x1F ? 0x1F : cb + bv;
-        row[x] = (cr << 11) | (cg << 5) | cb;
-      }
-    }
-
-    // Draw label for ALL orbs - clean, no background
     if (orb->short_label[0]) {
-      float label_x = px + rad + 6.0f;
+      int label_w = (int)strlen(orb->short_label) * 6;  // 6px per char at scale 1
+      // Side flips are eased by orbit position (label sits on the outer side),
+      // rather than snapping when it hits the screen edge.
+      float side = clampf((cosf(orb->orbit_angle) + 0.3f) / 0.6f, 0, 1);  // 0 left .. 1 right
+      side = side * side * (3 - 2 * side);
+      float off = -(rad + 6.0f) - label_w + side * (2.0f * (rad + 6.0f) + label_w);
+      float label_x = px + off;
       float label_y = py - 4.0f;
-
-      // Ensure label stays on screen
-      int label_w = strlen(orb->short_label) * 6;  // 6px per char at scale 1
-      if (label_x + label_w > W - 10) label_x = px - rad - label_w - 6.0f;
+      if (label_x + label_w > W - 4) label_x = W - 4 - label_w;
+      if (label_x < 4) label_x = 4;
       if (label_y < 10) label_y = 10;
       if (label_y > H - 20) label_y = H - 20;
-
-      // Primary orb gets slightly brighter label
-      float lr = r, lg = g, lb = b;
-      if (!orb->is_primary) { lr *= 0.7f; lg *= 0.7f; lb *= 0.7f; }
-
+      float lk = 0.7f + 0.3f * orb->prim;
       wtext(back, W, H, STRIDE, (int)label_x, (int)label_y,
-            orb->short_label, 1, lr, lg, lb);
+            orb->short_label, 1, orb_r[i] * lk, orb_g[i] * lk, orb_b[i] * lk);
     }
   }
 }
@@ -1131,97 +1095,140 @@ static void read_portfolio_stats(PortfolioStats *p) {
   memset(p, 0, sizeof(*p));
   FILE *f = fopen("/tmp/iris_portfolio", "r");
   if (!f) return;
-  char buf[64] = {0};
+  char buf[128] = {0};
   if (fgets(buf, sizeof(buf) - 1, f)) {
-    float total = 0, pct = 0;
-    if (sscanf(buf, "%f|%f", &total, &pct) == 2) {
+    float total = 0, pct = 0, qty = 0, val = 0, cpct = 0;
+    char sym[16] = {0};
+    // New format: total|pnl|symbol|qty|value|pnl_pct
+    int n = sscanf(buf, "%f|%f|%15[^|]|%f|%f|%f", &total, &pct, sym, &qty, &val, &cpct);
+    if (n >= 2) {
       p->have = 1; p->total = total; p->pnl_pct = pct;
+      if (n >= 6 && sym[0]) {
+        strncpy(p->crypto_symbol, sym, sizeof(p->crypto_symbol) - 1);
+        p->crypto_qty = qty;
+        p->crypto_value = val;
+        p->crypto_pnl_pct = cpct;
+      }
     }
   }
   fclose(f);
 }
 
-// Bottom full-width agent panel.
+// Bottom full-width agent panel - organized into 4 clean columns
+// NIGHT pill in the bottom panel (COL2, second row). iris_fb.c pads this for
+// its tap zone, so keep them in sync through these macros.
+#define NS_PILL_X     282
+#define NS_PILL_Y(H)  ((H) - 58 + 22)
+#define NS_PILL_W     64
+#define NS_PILL_H     16
+
 static void draw_agent_panel(uint16_t *back, int W, int H, int STRIDE, const AgentStats *a, int ns_manual, const PortfolioStats *pf) {
   const float cyan_r = 0.35f, cyan_g = 0.75f, cyan_b = 0.95f;
   const float dim_r = 0.40f, dim_g = 0.45f, dim_b = 0.52f;
   const float ok_r = 0.25f, ok_g = 0.85f, ok_b = 0.45f;
   const float bad_r = 0.95f, bad_g = 0.30f, bad_b = 0.30f;
   char buf[48];
-  int y = H - 58;   // strip top
+  int y = H - 58;   // panel top
+
+  // Clear panel background (dark semi-transparent)
+  wfill(back, W, H, STRIDE, 0, y - 8, W, 66, 0.02f, 0.03f, 0.05f);
 
   // separator line
   for (int x = 12; x < W - 12; x++) wput(back, W, H, STRIDE, x, y - 8, 0.14f, 0.16f, 0.20f);
 
-  // HERMES label + version
-  int x = 12;
+  // Column layout for the 800px panel. Text is 6px/char * scale, so:
+  //   COL1  12..202  HERMES / state + activity bar
+  //   COL2 214..352  GATEWAY / TG status + NIGHT pill (tap target, see iris_fb.c)
+  //   COL3 364..472  AGENTS or task (max 9 chars) / SEEN
+  //   COL4 right-aligned to W-12 (portfolio), never wider than ~300px
+  const int COL1 = 12;
+  const int COL2 = 214;
+  const int COL3 = 364;
+
+  // ====== COL 1: HERMES + STATE ======
+  int x = COL1;
   x = wtext(back, W, H, STRIDE, x, y, "HERMES", 2, dim_r, dim_g, dim_b);
   snprintf(buf, sizeof(buf), "V%s", a->version);
   wtext(back, W, H, STRIDE, x + 6, y + 2, buf, 1, dim_r, dim_g, dim_b);
 
-  // STATE: THINKING / IDLE + activity bar
   const char *stxt = a->thinking ? "THINKING" : "IDLE";
   float sr = a->thinking ? cyan_r : dim_r, sg = a->thinking ? cyan_g : dim_g, sb = a->thinking ? cyan_b : dim_b;
-  wtext(back, W, H, STRIDE, 12, y + 24, stxt, 2, sr, sg, sb);
-  wbar(back, W, H, STRIDE, 120, y + 26, 120, 8, a->activity * 100.0f);
+  wtext(back, W, H, STRIDE, COL1, y + 24, stxt, 2, sr, sg, sb);
+  wbar(back, W, H, STRIDE, COL1 + 104, y + 26, 86, 8, a->activity * 100.0f);   // after "THINKING" (96px)
 
-  // GATEWAY dot
-  int gx = 300;
+  // ====== COL 2: GATEWAY + TELEGRAM ======
   float gr = a->gateway_up ? ok_r : bad_r, gg = a->gateway_up ? ok_g : bad_g, gb = a->gateway_up ? ok_b : bad_b;
   for (int yy = 0; yy < 10; yy++) for (int xx = 0; xx < 10; xx++)
-    if ((xx-5)*(xx-5)+(yy-5)*(yy-5) <= 25) wput(back, W, H, STRIDE, gx+xx, y+2+yy, gr, gg, gb);
-  wtext(back, W, H, STRIDE, gx + 16, y, "GATEWAY", 2, dim_r, dim_g, dim_b);
-  wtext(back, W, H, STRIDE, gx + 16, y + 22, a->telegram_ok ? "TELEGRAM OK" : "TG DOWN", 1,
+    if ((xx-5)*(xx-5)+(yy-5)*(yy-5) <= 25) wput(back, W, H, STRIDE, COL2+xx, y+2+yy, gr, gg, gb);
+  wtext(back, W, H, STRIDE, COL2 + 16, y, "GATEWAY", 2, dim_r, dim_g, dim_b);
+  wtext(back, W, H, STRIDE, COL2 + 16, y + 26, a->telegram_ok ? "TG OK" : "TG DOWN", 1,
         a->telegram_ok ? ok_r : bad_r, a->telegram_ok ? ok_g : bad_g, a->telegram_ok ? ok_b : bad_b);
 
-  // AGENTS / TASK TAG (right column): task label (cyan) when active; else agents or IDLE
-  int ax = 500;
-  if (a->task_label[0]) {
-    snprintf(buf, sizeof(buf), "%s", a->task_label);
-    wtext(back, W, H, STRIDE, ax, y, buf, 2, cyan_r, cyan_g, cyan_b);
-    wtext(back, W, H, STRIDE, ax, y + 24, "WORKING", 1, dim_r, dim_g, dim_b);
-  } else {
-    snprintf(buf, sizeof(buf), "AGENTS %d", a->active_agents);
-    wtext(back, W, H, STRIDE, ax, y, buf, 2,
-          a->active_agents > 0 ? cyan_r : dim_r, a->active_agents > 0 ? cyan_g : dim_g, a->active_agents > 0 ? cyan_b : dim_b);
-    // If truly idle (no agents, no thinking), show IDLE as sub-label in dim
-    const char *sub = (a->active_agents == 0 && !a->thinking) ? "IDLE" : "";
-    wtext(back, W, H, STRIDE, ax, y + 24, sub, 1, dim_r, dim_g, dim_b);
+  // NIGHT pill: always drawn (dim when off) so the tap target is visible.
+  {
+    int nx = NS_PILL_X, ny = NS_PILL_Y(H);
+    if (ns_manual) {
+      wfill(back, W, H, STRIDE, nx, ny, NS_PILL_W, NS_PILL_H, 0.95f, 0.15f, 0.15f);
+      wtext(back, W, H, STRIDE, nx + 6, ny + 4, "NIGHT ON", 1, 0.95f, 0.95f, 0.95f);
+    } else {
+      wfill(back, W, H, STRIDE, nx, ny, NS_PILL_W, NS_PILL_H, 0.08f, 0.09f, 0.12f);
+      wtext(back, W, H, STRIDE, nx + 6, ny + 4, "NIGHT OFF", 1, dim_r, dim_g, dim_b);
+    }
   }
 
-  // PORTFOLIO (paper-trading fund) — far right column, own space so it never
-  // collides with AGENTS/TASK. Green above $1000 start, red below, dim if
-  // the cache hasn't been written yet (script/ledger not running).
-  int px = 650;
+  // ====== COL 3: AGENTS / TASK ======
+  if (a->task_label[0]) {
+    snprintf(buf, sizeof(buf), "%.9s", a->task_label);   // 9 chars max: stays in column
+    wtext(back, W, H, STRIDE, COL3, y, buf, 2, cyan_r, cyan_g, cyan_b);
+  } else {
+    snprintf(buf, sizeof(buf), "AGENTS %d", a->active_agents);
+    wtext(back, W, H, STRIDE, COL3, y, buf, 2,
+          a->active_agents > 0 ? cyan_r : dim_r, a->active_agents > 0 ? cyan_g : dim_g, a->active_agents > 0 ? cyan_b : dim_b);
+  }
+  // LAST ACTIVE (second row of the agents column; was drawn over "IDLE")
+  int ls = a->last_active_s;
+  if (ls < 60) snprintf(buf, sizeof(buf), "%sSEEN %dS", a->task_label[0] ? "WORKING " : "", ls);
+  else if (ls < 3600) snprintf(buf, sizeof(buf), "%sSEEN %dM", a->task_label[0] ? "WORKING " : "", ls / 60);
+  else snprintf(buf, sizeof(buf), "%sSEEN %dH", a->task_label[0] ? "WORKING " : "", ls / 3600);
+  wtext(back, W, H, STRIDE, COL3, y + 26, buf, 1, dim_r, dim_g, dim_b);
+
+  // ====== COL 4: PORTFOLIO, right-aligned so it can never run off the edge ======
+  const int RX = W - 12;   // right margin
   if (pf->have) {
-    char pfbuf[24];
-    snprintf(pfbuf, sizeof(pfbuf), "$%d", (int)(pf->total + 0.5f));
     float pr = pf->pnl_pct > 0 ? ok_r : pf->pnl_pct < 0 ? bad_r : dim_r;
     float pg = pf->pnl_pct > 0 ? ok_g : pf->pnl_pct < 0 ? bad_g : dim_g;
     float pb = pf->pnl_pct > 0 ? ok_b : pf->pnl_pct < 0 ? bad_b : dim_b;
-    wtext(back, W, H, STRIDE, px, y, pfbuf, 2, pr, pg, pb);
-    char pctbuf[16];
-    snprintf(pctbuf, sizeof(pctbuf), "%s%d.%d%%", pf->pnl_pct >= 0 ? "+" : "-",
-             abs((int)pf->pnl_pct), abs((int)(pf->pnl_pct * 10)) % 10);
-    wtext(back, W, H, STRIDE, px, y + 24, pctbuf, 1, pr, pg, pb);
+    // Row 1:  TOTAL $1019  +1.9%   (fixed-width fields so nothing shifts as values tick)
+    char pctbuf[16], pfbuf[24];
+    snprintf(pctbuf, sizeof(pctbuf), "%+5.1f%%", clampf(pf->pnl_pct, -99.9f, 99.9f));
+    snprintf(pfbuf, sizeof(pfbuf), "$%5d", (int)(pf->total + 0.5f));
+    int x4 = RX - (int)strlen(pctbuf) * 12;
+    wtext(back, W, H, STRIDE, x4, y, pctbuf, 2, pr, pg, pb);
+    x4 -= 8 + (int)strlen(pfbuf) * 12;
+    wtext(back, W, H, STRIDE, x4, y, pfbuf, 2, pr, pg, pb);
+    wtext(back, W, H, STRIDE, x4 - 36, y + 4, "TOTAL", 1, dim_r, dim_g, dim_b);
+
+    // Row 2:  BTC 0.0088  $715  +2.1%
+    if (pf->crypto_symbol[0]) {
+      float cr = pf->crypto_pnl_pct > 0 ? ok_r : pf->crypto_pnl_pct < 0 ? bad_r : dim_r;
+      float cg = pf->crypto_pnl_pct > 0 ? ok_g : pf->crypto_pnl_pct < 0 ? bad_g : dim_g;
+      float cb = pf->crypto_pnl_pct > 0 ? ok_b : pf->crypto_pnl_pct < 0 ? bad_b : dim_b;
+      const char *sym = strncmp(pf->crypto_symbol, "X:", 2) == 0 ? pf->crypto_symbol + 2 : pf->crypto_symbol;
+      char cpct[16], cval[16], cqty[32];
+      snprintf(cpct, sizeof(cpct), "%+5.1f%%", clampf(pf->crypto_pnl_pct, -99.9f, 99.9f));
+      snprintf(cval, sizeof(cval), "$%4d", (int)(pf->crypto_value + 0.5f));
+      snprintf(cqty, sizeof(cqty), "%.4s %.4f", sym, pf->crypto_qty);
+      int cx = RX - (int)strlen(cpct) * 12;
+      wtext(back, W, H, STRIDE, cx, y + 24, cpct, 2, cr, cg, cb);
+      cx -= 8 + (int)strlen(cval) * 12;
+      wtext(back, W, H, STRIDE, cx, y + 24, cval, 2, cr, cg, cb);
+      cx -= 8 + (int)strlen(cqty) * 6;
+      wtext(back, W, H, STRIDE, cx, y + 28, cqty, 1, cr, cg, cb);
+    }
   } else {
-    wtext(back, W, H, STRIDE, px, y, "PORTFOLIO", 1, dim_r, dim_g, dim_b);
-    wtext(back, W, H, STRIDE, px, y + 24, "NO DATA", 1, dim_r, dim_g, dim_b);
+    wtext(back, W, H, STRIDE, RX - 54, y, "PORTFOLIO", 1, dim_r, dim_g, dim_b);
+    wtext(back, W, H, STRIDE, RX - 42, y + 24, "NO DATA", 1, dim_r, dim_g, dim_b);
   }
-
-  // NIGHT MODE pill (manual toggle) - visible pill in agent panel, tappable zone below it
-  int npill_x = 460, npill_y = H - 38;
-  int npill_w = 72, npill_h = 18;
-  float np_r = ns_manual ? 0.95f : 0.3f, np_g = 0.15f, np_b = 0.15f;
-  wfill(back, W, H, STRIDE, npill_x, npill_y, npill_w, npill_h, np_r, np_g, np_b);
-  wtext(back, W, H, STRIDE, npill_x + 6, npill_y + 3, ns_manual ? "NIGHT ON" : "NIGHT OFF", 1, 0.95f, 0.95f, 0.95f);
-
-  // LAST ACTIVE
-  int ls = a->last_active_s;
-  if (ls < 60) snprintf(buf, sizeof(buf), "SEEN %dS", ls);
-  else if (ls < 3600) snprintf(buf, sizeof(buf), "SEEN %dM", ls / 60);
-  else snprintf(buf, sizeof(buf), "SEEN %dH", ls / 3600);
-  wtext(back, W, H, STRIDE, ax, y + 24, buf, 1, dim_r, dim_g, dim_b);
 }
 
 #endif
