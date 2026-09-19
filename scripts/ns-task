@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""ns-task: announce what an autonomous (cron) Hermes run is working on.
+
+Shown live on the Iris LCD while night shift runs.
+
+  ns-task plan "Compact sessions" "Commit WIP" "Stage proposals"   queue upcoming tasks
+  ns-task start "Commit WIP"          start a task (finishes the previous one)
+  ns-task start --parallel "X" "Y"    run several at once (keeps others active)
+  ns-task done ["Commit"]             finish the active task (or those matching)
+  ns-task show | clear
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "plugin"))
+import ns_lanes  # noqa: E402
+
+args = sys.argv[1:]
+if not args or args[0] in ("-h", "--help") or args[0] not in ("plan", "start", "done", "show", "clear"):
+    print(__doc__.strip())
+    sys.exit(0 if args and args[0] in ("-h", "--help") else 2)
+action, rest = args[0], args[1:]
+parallel = "--parallel" in rest
+titles = [t for t in rest if t != "--parallel"]
+if action in ("plan", "start") and not titles:
+    sys.exit(f"ns-task {action}: give at least one task title")
+sid = os.environ.get("HERMES_SESSION_ID") or os.environ.get("HERMES_SESSION")
+print(ns_lanes.task_cmd(action,
+                        titles, sid, parallel))

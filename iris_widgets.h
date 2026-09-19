@@ -14,7 +14,7 @@
 
 // ---- 5x7 bitmap font: ASCII 32..90 (space..Z) + a few punctuation. ----
 // Each glyph is 5 columns x 7 rows, stored as 5 bytes (low 7 bits = rows top->bottom).
-// Covers: space ! % . / : 0-9 A-Z  (enough for clock, dates, stats labels).
+// Covers: space, 0-9, A-Z and common punctuation (log lines, paths, task titles).
 // Missing chars render as blank.
 typedef struct { char c; uint8_t col[5]; } Glyph;
 
@@ -22,7 +22,7 @@ typedef struct { char c; uint8_t col[5]; } Glyph;
 static const Glyph FONT[] = {
   {' ',{0,0,0,0,0}},
   {'!',{0x00,0x00,0x5F,0x00,0x00}},
-  {'$',{0x24,0x54,0xFF,0x54,0x48}},
+  {'$',{0x24,0x2A,0x7F,0x2A,0x12}},
   {'%',{0x23,0x13,0x08,0x64,0x62}},
   {'+',{0x08,0x08,0x3E,0x08,0x08}},
   {'.',{0x00,0x60,0x60,0x00,0x00}},
@@ -63,6 +63,28 @@ static const Glyph FONT[] = {
   {'V',{0x1F,0x20,0x40,0x20,0x1F}},
   {'W',{0x7F,0x20,0x18,0x20,0x7F}},
   {'Y',{0x07,0x08,0x70,0x08,0x07}},
+  {'J',{0x20,0x40,0x41,0x3F,0x01}},
+  {'X',{0x63,0x14,0x08,0x14,0x63}},
+  {'Z',{0x61,0x51,0x49,0x45,0x43}},
+  {'\'',{0x00,0x00,0x07,0x00,0x00}},
+  {'"',{0x00,0x07,0x00,0x07,0x00}},
+  {',',{0x00,0x50,0x30,0x00,0x00}},
+  {';',{0x00,0x56,0x36,0x00,0x00}},
+  {'(',{0x00,0x1C,0x22,0x41,0x00}},
+  {')',{0x00,0x41,0x22,0x1C,0x00}},
+  {'[',{0x00,0x7F,0x41,0x41,0x00}},
+  {']',{0x00,0x41,0x41,0x7F,0x00}},
+  {'<',{0x08,0x14,0x22,0x41,0x00}},
+  {'>',{0x00,0x41,0x22,0x14,0x08}},
+  {'=',{0x14,0x14,0x14,0x14,0x14}},
+  {'#',{0x14,0x7F,0x14,0x7F,0x14}},
+  {'&',{0x36,0x49,0x55,0x22,0x50}},
+  {'*',{0x14,0x08,0x3E,0x08,0x14}},
+  {'?',{0x02,0x01,0x51,0x09,0x06}},
+  {'@',{0x32,0x49,0x79,0x41,0x3E}},
+  {'~',{0x08,0x04,0x08,0x10,0x08}},
+  {'|',{0x00,0x00,0x7F,0x00,0x00}},
+  {'\\',{0x02,0x04,0x08,0x10,0x20}},
   {'a',{0x20,0x54,0x54,0x54,0x78}}, // lowercase a-z fall back to uppercase glyphs below
 };
 
@@ -454,15 +476,15 @@ static int ns_running_check(void) {
 // the iris plugin during a night-shift run (tool-by-tool progress); fall back to
 // the newest run's final report if no live log exists. Meant to be called ~1Hz
 // off the render cadence, not per frame.
-// "/home/humdan/.hermes/x" -> ".hermes/x" in place, so log lines fit the
-// narrow column (the 5x7 font has no '~' glyph to abbreviate with).
+// "/home/humdan/..." -> "~/..." in place, so log lines fit the narrow column.
 static void ns_shorten_home(char *raw) {
   const char *home = getenv("HOME");
   size_t hl = home ? strlen(home) : 0;
   if (hl < 2) return;
   for (char *p = raw; (p = strstr(p, home)) != NULL; ) {
-    size_t cut = hl + (p[hl] == '/' ? 1 : 0);
-    memmove(p, p + cut, strlen(p + cut) + 1);
+    p[0] = '~';
+    memmove(p + 1, p + hl, strlen(p + hl) + 1);
+    p++;
   }
 }
 
@@ -558,6 +580,295 @@ static void ns_read_transcript(NightConsole *nc) {
 // `firing_active` = 1 while showing the brief FIRING feedback after a tap.
 // Night-shift log panel in the left column: header, status, the live step log
 // (long lines wrap to the column width, newest at the bottom).
+// ---- Night-shift TASK view: what each running cron lane is working on ----
+// Written by plugin/ns_lanes.py (lanes + latest step, from Hermes hooks) and
+// the `ns-task` CLI (named tasks the night-shift agent announces).
+#define NSV_FILE    "/tmp/iris_ns_view.txt"
+#define NSV_LANES   6
+#define NSV_TASKS   16
+#define NSV_STALE_S (45 * 60)
+typedef struct { char st; long started, ended; char title[96]; } NsTask;
+typedef struct {
+  char name[40]; long started; int is_ns;
+  char step[128]; long step_at;
+  int nt; NsTask t[NSV_TASKS];
+} NsLane;
+#define NSV_BOARD 8
+typedef struct {
+  int nl; NsLane lanes[NSV_LANES];
+  // tonight's night-shift kanban board: open count, queued + finished titles
+  int open_cards, nq, nd;
+  char queued[NSV_BOARD][96], done[NSV_BOARD][96];
+} NsView;
+
+static void ns_shorten_home(char *raw);
+
+static void nsv_copy(char *dst, size_t n, const char *src) {
+  size_t i = 0;
+  for (; src[i] && src[i] != '\n' && i < n - 1; i++) dst[i] = src[i];
+  dst[i] = 0;
+}
+
+static void read_ns_view(NsView *v) {
+  memset(v, 0, sizeof(*v));
+  struct stat sb;
+  if (stat(NSV_FILE, &sb) != 0 || time(NULL) - sb.st_mtime > NSV_STALE_S) return;
+  FILE *f = fopen(NSV_FILE, "r");
+  if (!f) return;
+  char line[512];
+  NsLane *L = NULL;
+  while (fgets(line, sizeof(line), f)) {
+    char *fld[5] = {0}; int nf = 0;
+    char *p = line;
+    // split on '|' into at most 5 fields; the last field keeps the rest
+    while (nf < 5) {
+      fld[nf++] = p;
+      if (nf == 5 || !(p = strchr(p, '|'))) break;
+      *p++ = 0;
+    }
+    if (fld[0][0] == 'L' && nf >= 4 && v->nl < NSV_LANES) {
+      L = &v->lanes[v->nl++];
+      nsv_copy(L->name, sizeof(L->name), fld[1]);
+      L->started = atol(fld[2]); L->is_ns = atoi(fld[3]);
+    } else if (fld[0][0] == 'S' && nf >= 3 && L) {
+      L->step_at = atol(fld[1]);
+      nsv_copy(L->step, sizeof(L->step), fld[2]);
+      ns_shorten_home(L->step);
+    } else if (fld[0][0] == 'N' && nf >= 2) {
+      v->open_cards = atoi(fld[1]);
+    } else if (fld[0][0] == 'Q' && nf >= 2 && v->nq < NSV_BOARD) {
+      nsv_copy(v->queued[v->nq++], 96, fld[1]);
+    } else if (fld[0][0] == 'D' && nf >= 2 && v->nd < NSV_BOARD) {
+      nsv_copy(v->done[v->nd++], 96, fld[1]);
+    } else if (fld[0][0] == 'T' && nf >= 5 && L && L->nt < NSV_TASKS) {
+      NsTask *t = &L->t[L->nt++];
+      t->st = fld[1][0]; t->started = atol(fld[2]); t->ended = atol(fld[3]);
+      nsv_copy(t->title, sizeof(t->title), fld[4]);
+    }
+  }
+  fclose(f);
+}
+
+static void fmt_elapsed(char *out, size_t n, long secs) {
+  if (secs < 0) secs = 0;
+  if (secs < 60) snprintf(out, n, "%lldS", (long long)secs);
+  else if (secs < 3600) snprintf(out, n, "%lldM", (long long)(secs / 60));
+  else snprintf(out, n, "%lldH%02lldM", (long long)(secs / 3600), (long long)(secs % 3600 / 60));
+}
+
+// Draw `text` wrapped to `cols` chars per row, at most `max_rows` rows (the last
+// row gets ".." if truncated). Returns the y after the last row.
+static int wtext_wrap(uint16_t *back, int W, int H, int STRIDE, int x, int y, const char *text,
+                      int scale, int cols, int max_rows, int row_h, float r, float g, float b) {
+  int len = (int)strlen(text), off = 0, row = 0;
+  char seg[128];
+  while (off < len && row < max_rows) {
+    int cnt = len - off;
+    if (cnt > cols) {
+      cnt = cols;
+      // prefer breaking at a space
+      for (int k = cols; k > cols / 2; k--) if (text[off + k] == ' ') { cnt = k; break; }
+    }
+    if (cnt > (int)sizeof(seg) - 3) cnt = sizeof(seg) - 3;
+    memcpy(seg, text + off, cnt); seg[cnt] = 0;
+    off += cnt; while (text[off] == ' ') off++;
+    if (row == max_rows - 1 && off < len && cnt >= 2) { seg[cnt - 2] = '.'; seg[cnt - 1] = '.'; }
+    wtext(back, W, H, STRIDE, x, y, seg, scale, r, g, b);
+    y += row_h; row++;
+  }
+  return y;
+}
+
+// Left-column task panel while night shift runs: NOW (active task(s) + live
+// step), NEXT (queued), DONE (recent), and ALSO RUNNING (parallel cron lanes).
+static void draw_night_tasks(uint16_t *back, int W, int H, int STRIDE,
+                             const NsView *v, int ns_manual, float pulse) {
+  const float dim_r = 0.55f, dim_g = 0.60f, dim_b = 0.68f;
+  const float cy_r = 0.35f, cy_g = 0.75f, cy_b = 0.95f;
+  const float ok_r = 0.25f, ok_g = 0.85f, ok_b = 0.45f;
+  const float red_r = 0.95f, red_g = 0.30f, red_b = 0.30f;
+  const float step_r = 0.55f, step_g = 0.85f, step_b = 0.70f;
+  time_t now = time(NULL);
+  char buf[64];
+
+  int px = NSC_X + 12, py = NSC_Y + 12;
+  int bottom = NSC_Y + NSC_H - 4;
+  int cols1 = (NSC_X + NSC_W - 8 - px) / 6, cols2 = (NSC_X + NSC_W - 8 - px) / 12;
+  float pk = 0.55f + 0.45f * pulse;
+  wfill(back, W, H, STRIDE, NSC_X + 2, NSC_Y + 4, 3, NSC_H - 8, red_r * pk, red_g * pk, red_b * pk);
+
+  // header: NIGHT SHIFT  RUNNING 12M
+  wtext(back, W, H, STRIDE, px, py, "NIGHT SHIFT", 2, red_r * pk, red_g * pk, red_b * pk);
+  const NsLane *ns = NULL;                      // coordinator (kickoff / supervisor)
+  long shift_start = 0;
+  for (int i = 0; i < v->nl; i++) {
+    if (v->lanes[i].is_ns == 1 && !ns) ns = &v->lanes[i];
+    if (v->lanes[i].is_ns && (!shift_start || v->lanes[i].started < shift_start)) shift_start = v->lanes[i].started;
+  }
+  {
+    char el[16]; fmt_elapsed(el, sizeof(el), shift_start ? now - shift_start : 0);
+    if (shift_start) snprintf(buf, sizeof(buf), "RUNNING %s", el);
+    else snprintf(buf, sizeof(buf), "%d CARD%s QUEUED", v->open_cards, v->open_cards == 1 ? "" : "S");
+    int sx = px + 11 * 12 + 12;
+    wtext(back, W, H, STRIDE, sx, py + 4, buf, 1, ok_r, ok_g, ok_b);
+    if (ns_manual) wtext(back, W, H, STRIDE, sx, py + 14, "MANUAL MODE", 1, red_r, red_g, red_b);
+  }
+  int y = py + 28;
+  for (int x = px; x < NSC_X + NSC_W - 8; x++) wput(back, W, H, STRIDE, x, y, 0.14f, 0.18f, 0.22f);
+  y += 8;
+
+  // ---- NOW: coordinator's active tasks + every running night worker ----
+  wtext(back, W, H, STRIDE, px, y, "NOW", 1, red_r, red_g, red_b);
+  y += 12;
+  int nnow = 0;
+  if (ns) {
+    for (int i = 0; i < ns->nt && y < bottom - 30; i++) {
+      const NsTask *t = &ns->t[i];
+      if (t->st != 'a') continue;
+      nnow++;
+      y = wtext_wrap(back, W, H, STRIDE, px, y, t->title, 2, cols2, 1, 18, cy_r, cy_g, cy_b);
+      char el[16]; fmt_elapsed(el, sizeof(el), now - t->started);
+      snprintf(buf, sizeof(buf), "FOR %s", el);
+      wtext(back, W, H, STRIDE, px, y, buf, 1, dim_r, dim_g, dim_b);
+      y += 12;
+    }
+  }
+  for (int i = 0; i < v->nl && y < bottom - 30; i++) {
+    const NsLane *L = &v->lanes[i];
+    if (L->is_ns != 2) continue;
+    nnow++;
+    y = wtext_wrap(back, W, H, STRIDE, px, y, L->name, 2, cols2, 1, 18, cy_r, cy_g, cy_b);
+    char el[16]; fmt_elapsed(el, sizeof(el), now - L->started);
+    if (L->step[0]) {
+      char line[160]; snprintf(line, sizeof(line), "%s  %s", el, L->step);
+      y = wtext_wrap(back, W, H, STRIDE, px, y, line, 1, cols1, 1, 11, step_r, step_g, step_b);
+    } else {
+      wtext(back, W, H, STRIDE, px, y, el, 1, dim_r, dim_g, dim_b); y += 11;
+    }
+    y += 3;
+  }
+  if (nnow == 0) {
+    wtext(back, W, H, STRIDE, px, y, ns ? "PLANNING..." : "BETWEEN TASKS", 2, cy_r, cy_g, cy_b);
+    y += 20;
+  }
+  if (ns && ns->step[0] && y < bottom - 12)   // coordinator's live step
+    y = wtext_wrap(back, W, H, STRIDE, px, y, ns->step, 1, cols1, 1, 11, step_r, step_g, step_b);
+  y += 8;
+
+  // ---- NEXT: coordinator's planned tasks + queued night cards ----
+  int nq = v->nq;
+  if (ns) for (int i = 0; i < ns->nt; i++) if (ns->t[i].st == 'q') nq++;
+  if (nq && y < bottom - 24) {
+    snprintf(buf, sizeof(buf), "NEXT %d", nq);
+    wtext(back, W, H, STRIDE, px, y, buf, 1, dim_r, dim_g, dim_b);
+    y += 12;
+    int shown = 0;
+    if (ns) for (int i = 0; i < ns->nt && shown < 3 && y < bottom - 11; i++) {
+      if (ns->t[i].st != 'q') continue;
+      snprintf(buf, sizeof(buf), "- %.60s", ns->t[i].title);
+      y = wtext_wrap(back, W, H, STRIDE, px, y, buf, 1, cols1, 1, 11, dim_r, dim_g, dim_b); shown++;
+    }
+    for (int i = 0; i < v->nq && shown < 3 && y < bottom - 11; i++, shown++) {
+      snprintf(buf, sizeof(buf), "- %.60s", v->queued[i]);
+      y = wtext_wrap(back, W, H, STRIDE, px, y, buf, 1, cols1, 1, 11, dim_r, dim_g, dim_b);
+    }
+    y += 8;
+  }
+
+  // ---- DONE: finished night cards (newest first) + coordinator's done tasks ----
+  int nd = v->nd;
+  if (ns) for (int i = 0; i < ns->nt; i++) if (ns->t[i].st == 'd') nd++;
+  if (nd && y < bottom - 24) {
+    snprintf(buf, sizeof(buf), "DONE %d", nd);
+    wtext(back, W, H, STRIDE, px, y, buf, 1, ok_r, ok_g, ok_b);
+    y += 12;
+    int shown = 0;
+    for (int i = 0; i < v->nd && shown < 4 && y < bottom - 11; i++, shown++) {
+      snprintf(buf, sizeof(buf), "+ %.60s", v->done[i]);
+      y = wtext_wrap(back, W, H, STRIDE, px, y, buf, 1, cols1, 1, 11, ok_r * 0.8f, ok_g * 0.8f, ok_b * 0.8f);
+    }
+    if (ns) for (int i = ns->nt - 1; i >= 0 && shown < 4 && y < bottom - 11; i--) {
+      if (ns->t[i].st != 'd') continue;
+      snprintf(buf, sizeof(buf), "+ %.60s", ns->t[i].title);
+      y = wtext_wrap(back, W, H, STRIDE, px, y, buf, 1, cols1, 1, 11, ok_r * 0.8f, ok_g * 0.8f, ok_b * 0.8f);
+      shown++;
+    }
+    y += 8;
+  }
+
+  // ---- ALSO RUNNING: other cron lanes in parallel ----
+  int others = 0;
+  for (int i = 0; i < v->nl; i++) if (!v->lanes[i].is_ns) others++;
+  if (others && y < bottom - 24) {
+    wtext(back, W, H, STRIDE, px, y, ns ? "ALSO RUNNING" : "RUNNING", 1, dim_r, dim_g, dim_b);
+    y += 12;
+    for (int i = 0; i < v->nl && y < bottom - 11; i++) {
+      const NsLane *L = &v->lanes[i];
+      if (L->is_ns) continue;
+      char el[16]; fmt_elapsed(el, sizeof(el), now - L->started);
+      snprintf(buf, sizeof(buf), "%.40s  %s", L->name, el);
+      wtext(back, W, H, STRIDE, px, y, buf, 1, cy_r, cy_g, cy_b); y += 11;
+      const NsTask *act = NULL;
+      for (int k = 0; k < L->nt; k++) if (L->t[k].st == 'a') act = &L->t[k];
+      const char *what = act ? act->title : L->step;
+      if (what[0] && y < bottom - 11)
+        y = wtext_wrap(back, W, H, STRIDE, px + 12, y, what, 1, cols1 - 2, 1, 11, step_r, step_g, step_b);
+      y += 4;
+    }
+  }
+}
+
+// Epoch of Hermes's last cron scheduler tick (it ticks every 60s), 0 if unknown.
+static double read_cron_tick(void) {
+  char path[256];
+  const char *home = getenv("HOME");
+  snprintf(path, sizeof(path), "%s/.hermes/cron/ticker_heartbeat", home ? home : "/home/humdan");
+  FILE *f = fopen(path, "r");
+  if (!f) return 0;
+  double v = 0;
+  if (fscanf(f, "%lf", &v) != 1) v = 0;
+  fclose(f);
+  return v;
+}
+
+// Left panel between the button tap and the run going live.
+static void draw_night_starting(uint16_t *back, int W, int H, int STRIDE, double tick_at, float pulse) {
+  const float dim_r = 0.55f, dim_g = 0.60f, dim_b = 0.68f;
+  const float red_r = 0.95f, red_g = 0.30f, red_b = 0.30f;
+  const float amb_r = 0.95f, amb_g = 0.75f, amb_b = 0.20f;
+  int px = NSC_X + 12, py = NSC_Y + 12;
+  float pk = 0.55f + 0.45f * pulse;
+  wfill(back, W, H, STRIDE, NSC_X + 2, NSC_Y + 4, 3, NSC_H - 8, red_r * pk, red_g * pk, red_b * pk);
+  wtext(back, W, H, STRIDE, px, py, "NIGHT SHIFT", 2, red_r * pk, red_g * pk, red_b * pk);
+  int y = py + 28;
+  for (int x = px; x < NSC_X + NSC_W - 8; x++) wput(back, W, H, STRIDE, x, y, 0.14f, 0.18f, 0.22f);
+  y += 16;
+
+  struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+  double now = ts.tv_sec + ts.tv_nsec * 1e-9;
+  int left = tick_at > 0 ? (int)(tick_at + 60.0 - now + 0.999) : -1;
+  char buf[48];
+  if (left > 0 && left <= 60) {
+    wtext(back, W, H, STRIDE, px, y, "STARTING", 2, amb_r, amb_g, amb_b);
+    y += 26;
+    snprintf(buf, sizeof(buf), "IN %dS", left);
+    wtext(back, W, H, STRIDE, px, y, buf, 4, amb_r, amb_g, amb_b);
+    y += 40;
+    wtext(back, W, H, STRIDE, px, y, "QUEUED - HERMES PICKS IT UP ON ITS", 1, dim_r, dim_g, dim_b);
+    wtext(back, W, H, STRIDE, px, y + 11, "NEXT SCHEDULER TICK (EVERY 60S)", 1, dim_r, dim_g, dim_b);
+  } else {
+    wtext(back, W, H, STRIDE, px, y, "WARMING UP", 2, amb_r, amb_g, amb_b);
+    y += 26;
+    // three dots cycling so it visibly isn't frozen
+    int n = 1 + (int)(now * 2.0) % 3;
+    snprintf(buf, sizeof(buf), "%.*s", n, "...");
+    wtext(back, W, H, STRIDE, px, y, buf, 4, amb_r, amb_g, amb_b);
+    y += 40;
+    wtext(back, W, H, STRIDE, px, y, "GATHERING TODAY'S CONTEXT AND", 1, dim_r, dim_g, dim_b);
+    wtext(back, W, H, STRIDE, px, y + 11, "STARTING THE AGENT (~30-60S)", 1, dim_r, dim_g, dim_b);
+  }
+}
+
 // Top-right NIGHT SHIFT button: RUN when idle, STARTING after a tap, a pulsing
 // (non-tappable) RUNNING while a run is live.
 static void draw_ns_run_button(uint16_t *back, int W, int H, int STRIDE,
@@ -714,6 +1025,8 @@ typedef struct {
   int thinking;          // activity high / state == thinking
   int gateway_up;        // gateway_state == running
   int telegram_ok;       // telegram platform connected
+  int dashboard_up;      // dashboard systemd service active
+  int iris_up;           // iris systemd service active
   int active_agents;     // subagents currently working
   int last_active_s;     // seconds since gateway updated_at
   char version[16];      // hermes code_version
@@ -800,22 +1113,44 @@ static void read_agent_stats(AgentStats *a) {
       if (q) { time_t up = parse_iso_utc(q + 1); if (up) { time_t d = time(NULL) - up; a->last_active_s = d < 0 ? 0 : (int)d; } }
     }
   }
+
+  // Check dashboard and iris systemd services (refreshed ~1Hz)
+  FILE *fp = popen("systemctl --user is-active dashboard 2>/dev/null", "r");
+  if (fp) {
+    char buf[32] = {0};
+    if (fgets(buf, sizeof(buf) - 1, fp)) {
+      a->dashboard_up = (strstr(buf, "active") != NULL);
+    }
+    pclose(fp);
+  }
+  fp = popen("systemctl --user is-active iris 2>/dev/null", "r");
+  if (fp) {
+    char buf[32] = {0};
+    if (fgets(buf, sizeof(buf) - 1, fp)) {
+      a->iris_up = (strstr(buf, "active") != NULL);
+    }
+    pclose(fp);
+  }
 }
 
 // ---- Paper-portfolio snapshot, refreshed via a tiny cache file the C loop reads
 // cheaply (~1Hz, same cadence as AgentStats). The cache is written by a small
 // wrapper script (see scripts/portfolio-cache.sh) that shells ledger.py status
 // -- keeps the render loop free of subprocess spawns. Format (one line,
-// pipe-delimited): "<total_value>|<pnl_pct>|<crypto_symbol>|<crypto_qty>|<crypto_value>|<crypto_pnl_pct>".
+// pipe-delimited): "total|pnl_pct|day_pnl_pct|crypto_symbol|crypto_qty|crypto_value|crypto_pnl_pct|stock_value|cash".
 typedef struct {
   int have;         // 1 if cache file present and parsed
   float total;       // total portfolio value in USD
-  float pnl_pct;      // % change since $1000 start
+  float pnl_pct;      // % change since $1000 start (overall)
+  float day_pnl_pct;  // % change vs previous day's close
   // Crypto fields (optional, only present if holding crypto)
   char crypto_symbol[16];  // e.g., "X:BTC"
   float crypto_qty;        // quantity held
   float crypto_value;      // USD value
   float crypto_pnl_pct;    // % P&L on crypto position
+  // Stock and cash fields
+  float stock_value;       // USD value of non-crypto positions
+  float cash;              // USD cash balance
 } PortfolioStats;
 
 
@@ -1095,19 +1430,23 @@ static void read_portfolio_stats(PortfolioStats *p) {
   memset(p, 0, sizeof(*p));
   FILE *f = fopen("/tmp/iris_portfolio", "r");
   if (!f) return;
-  char buf[128] = {0};
+  char buf[256] = {0};
   if (fgets(buf, sizeof(buf) - 1, f)) {
-    float total = 0, pct = 0, qty = 0, val = 0, cpct = 0;
+    float total = 0, pct = 0, day_pct = 0, qty = 0, val = 0, cpct = 0, stock = 0, cash = 0;
     char sym[16] = {0};
-    // New format: total|pnl|symbol|qty|value|pnl_pct
-    int n = sscanf(buf, "%f|%f|%15[^|]|%f|%f|%f", &total, &pct, sym, &qty, &val, &cpct);
-    if (n >= 2) {
-      p->have = 1; p->total = total; p->pnl_pct = pct;
-      if (n >= 6 && sym[0]) {
+    // New format: total|pnl_pct|day_pnl_pct|symbol|qty|value|pnl_pct|stock_value|cash
+    int n = sscanf(buf, "%f|%f|%f|%15[^|]|%f|%f|%f|%f|%f", &total, &pct, &day_pct, sym, &qty, &val, &cpct, &stock, &cash);
+    if (n >= 3) {
+      p->have = 1; p->total = total; p->pnl_pct = pct; p->day_pnl_pct = day_pct;
+      if (n >= 7 && sym[0]) {
         strncpy(p->crypto_symbol, sym, sizeof(p->crypto_symbol) - 1);
         p->crypto_qty = qty;
         p->crypto_value = val;
         p->crypto_pnl_pct = cpct;
+      }
+      if (n >= 9) {
+        p->stock_value = stock;
+        p->cash = cash;
       }
     }
   }
@@ -1128,7 +1467,7 @@ static void draw_agent_panel(uint16_t *back, int W, int H, int STRIDE, const Age
   const float ok_r = 0.25f, ok_g = 0.85f, ok_b = 0.45f;
   const float bad_r = 0.95f, bad_g = 0.30f, bad_b = 0.30f;
   char buf[48];
-  int y = H - 58;   // panel top
+  int y = H - 70;   // panel top (moved up 12px from 58 to avoid bottom bezel clip)
 
   // Clear panel background (dark semi-transparent)
   wfill(back, W, H, STRIDE, 0, y - 8, W, 66, 0.02f, 0.03f, 0.05f);
@@ -1156,13 +1495,23 @@ static void draw_agent_panel(uint16_t *back, int W, int H, int STRIDE, const Age
   wtext(back, W, H, STRIDE, COL1, y + 24, stxt, 2, sr, sg, sb);
   wbar(back, W, H, STRIDE, COL1 + 104, y + 26, 86, 8, a->activity * 100.0f);   // after "THINKING" (96px)
 
-  // ====== COL 2: GATEWAY + TELEGRAM ======
+  // ====== COL 2: GATEWAY + TELEGRAM + SERVICES ======
   float gr = a->gateway_up ? ok_r : bad_r, gg = a->gateway_up ? ok_g : bad_g, gb = a->gateway_up ? ok_b : bad_b;
   for (int yy = 0; yy < 10; yy++) for (int xx = 0; xx < 10; xx++)
     if ((xx-5)*(xx-5)+(yy-5)*(yy-5) <= 25) wput(back, W, H, STRIDE, COL2+xx, y+2+yy, gr, gg, gb);
   wtext(back, W, H, STRIDE, COL2 + 16, y, "GATEWAY", 2, dim_r, dim_g, dim_b);
-  wtext(back, W, H, STRIDE, COL2 + 16, y + 26, a->telegram_ok ? "TG OK" : "TG DOWN", 1,
+  wtext(back, W, H, STRIDE, COL2 + 16, y + 14, a->telegram_ok ? "TG OK" : "TG DOWN", 1,
         a->telegram_ok ? ok_r : bad_r, a->telegram_ok ? ok_g : bad_g, a->telegram_ok ? ok_b : bad_b);
+
+  // Dashboard & Iris service indicators
+  float dr = a->dashboard_up ? ok_r : bad_r, dg = a->dashboard_up ? ok_g : bad_g, db = a->dashboard_up ? ok_b : bad_b;
+  float ir = a->iris_up ? ok_r : bad_r, ig = a->iris_up ? ok_g : bad_g, ib = a->iris_up ? ok_b : bad_b;
+  wtext(back, W, H, STRIDE, COL2 + 16, y + 26, "DASH", 1, dim_r, dim_g, dim_b);
+  for (int yy = 0; yy < 6; yy++) for (int xx = 0; xx < 6; xx++)
+    if ((xx-3)*(xx-3)+(yy-3)*(yy-3) <= 9) wput(back, W, H, STRIDE, COL2 + 50 + xx, y + 27 + yy, dr, dg, db);
+  wtext(back, W, H, STRIDE, COL2 + 60, y + 26, "IRIS", 1, dim_r, dim_g, dim_b);
+  for (int yy = 0; yy < 6; yy++) for (int xx = 0; xx < 6; xx++)
+    if ((xx-3)*(xx-3)+(yy-3)*(yy-3) <= 9) wput(back, W, H, STRIDE, COL2 + 94 + xx, y + 27 + yy, ir, ig, ib);
 
   // NIGHT pill: always drawn (dim when off) so the tap target is visible.
   {
@@ -1192,42 +1541,71 @@ static void draw_agent_panel(uint16_t *back, int W, int H, int STRIDE, const Age
   else snprintf(buf, sizeof(buf), "%sSEEN %dH", a->task_label[0] ? "WORKING " : "", ls / 3600);
   wtext(back, W, H, STRIDE, COL3, y + 26, buf, 1, dim_r, dim_g, dim_b);
 
-  // ====== COL 4: PORTFOLIO, right-aligned so it can never run off the edge ======
-  const int RX = W - 12;   // right margin
+  // ====== COL 4: PORTFOLIO — compact aligned 3-row table ======
+  const int RX = W - 8;    // right margin
   if (pf->have) {
-    float pr = pf->pnl_pct > 0 ? ok_r : pf->pnl_pct < 0 ? bad_r : dim_r;
-    float pg = pf->pnl_pct > 0 ? ok_g : pf->pnl_pct < 0 ? bad_g : dim_g;
-    float pb = pf->pnl_pct > 0 ? ok_b : pf->pnl_pct < 0 ? bad_b : dim_b;
-    // Row 1:  TOTAL $1019  +1.9%   (fixed-width fields so nothing shifts as values tick)
-    char pctbuf[16], pfbuf[24];
-    snprintf(pctbuf, sizeof(pctbuf), "%+5.1f%%", clampf(pf->pnl_pct, -99.9f, 99.9f));
-    snprintf(pfbuf, sizeof(pfbuf), "$%5d", (int)(pf->total + 0.5f));
-    int x4 = RX - (int)strlen(pctbuf) * 12;
-    wtext(back, W, H, STRIDE, x4, y, pctbuf, 2, pr, pg, pb);
-    x4 -= 8 + (int)strlen(pfbuf) * 12;
-    wtext(back, W, H, STRIDE, x4, y, pfbuf, 2, pr, pg, pb);
-    wtext(back, W, H, STRIDE, x4 - 36, y + 4, "TOTAL", 1, dim_r, dim_g, dim_b);
+    // Fixed column positions (right-aligned, ~220px wide)
+    // Each column is fixed width so rows align perfectly
+    const int LABEL_X = RX - 215;   // asset label (50px wide)
+    const int VAL_X   = RX - 165;   // $value (50px wide) 
+    const int DAY_X   = RX - 115;   // day P&L% (40px wide)
+    const int OV_X    = RX - 75;    // overall P&L% / qty (40px wide)
+    const int ROW_H   = 16;         // row height
 
-    // Row 2:  BTC 0.0088  $715  +2.1%
+    // Header (scale 1, dim)
+    wtext(back, W, H, STRIDE, LABEL_X, y - 14, "ASSET", 1, dim_r, dim_g, dim_b);
+    wtext(back, W, H, STRIDE, VAL_X,   y - 14, "VALUE", 1, dim_r, dim_g, dim_b);
+    wtext(back, W, H, STRIDE, DAY_X,   y - 14, "DAY",   1, dim_r, dim_g, dim_b);
+    wtext(back, W, H, STRIDE, OV_X,    y - 14, "ALL",   1, dim_r, dim_g, dim_b);
+
+    // Separator line - full width
+    for (int xx = LABEL_X - 4; xx < RX; xx++) wput(back, W, H, STRIDE, xx, y - 10, 0.10f, 0.12f, 0.16f);
+
+    // Colors
+    float day_r = pf->day_pnl_pct > 0 ? ok_r : pf->day_pnl_pct < 0 ? bad_r : dim_r;
+    float day_g = pf->day_pnl_pct > 0 ? ok_g : pf->day_pnl_pct < 0 ? bad_g : dim_g;
+    float day_b = pf->day_pnl_pct > 0 ? ok_b : pf->day_pnl_pct < 0 ? bad_b : dim_b;
+    float ovr_r = pf->pnl_pct > 0 ? ok_r : pf->pnl_pct < 0 ? bad_r : dim_r;
+    float ovr_g = pf->pnl_pct > 0 ? ok_g : pf->pnl_pct < 0 ? bad_g : dim_g;
+    float ovr_b = pf->pnl_pct > 0 ? ok_b : pf->pnl_pct < 0 ? bad_b : dim_b;
+
+    // ---- Row 1: STOCK ----
+    char daybuf[16], ovrbuf[16], valbuf[16];
+    snprintf(daybuf, sizeof(daybuf), "%+5.1f%%", clampf(pf->day_pnl_pct, -99.9f, 99.9f));
+    snprintf(ovrbuf, sizeof(ovrbuf), "%+5.1f%%", clampf(pf->pnl_pct, -99.9f, 99.9f));
+    snprintf(valbuf, sizeof(valbuf), "$%5d", (int)(pf->stock_value + 0.5f));
+
+    wtext(back, W, H, STRIDE, LABEL_X, y, "STOCK", 1, cyan_r, cyan_g, cyan_b);
+    wtext(back, W, H, STRIDE, VAL_X,   y, valbuf,  2, day_r, day_g, day_b);
+    wtext(back, W, H, STRIDE, DAY_X,   y, daybuf,  1, day_r, day_g, day_b);
+    wtext(back, W, H, STRIDE, OV_X,    y, ovrbuf,  1, ovr_r, ovr_g, ovr_b);
+
+    // ---- Row 2: BTC ----
     if (pf->crypto_symbol[0]) {
       float cr = pf->crypto_pnl_pct > 0 ? ok_r : pf->crypto_pnl_pct < 0 ? bad_r : dim_r;
       float cg = pf->crypto_pnl_pct > 0 ? ok_g : pf->crypto_pnl_pct < 0 ? bad_g : dim_g;
       float cb = pf->crypto_pnl_pct > 0 ? ok_b : pf->crypto_pnl_pct < 0 ? bad_b : dim_b;
       const char *sym = strncmp(pf->crypto_symbol, "X:", 2) == 0 ? pf->crypto_symbol + 2 : pf->crypto_symbol;
-      char cpct[16], cval[16], cqty[32];
+      char cpct[16], cval[16], cqty[16];
       snprintf(cpct, sizeof(cpct), "%+5.1f%%", clampf(pf->crypto_pnl_pct, -99.9f, 99.9f));
-      snprintf(cval, sizeof(cval), "$%4d", (int)(pf->crypto_value + 0.5f));
-      snprintf(cqty, sizeof(cqty), "%.4s %.4f", sym, pf->crypto_qty);
-      int cx = RX - (int)strlen(cpct) * 12;
-      wtext(back, W, H, STRIDE, cx, y + 24, cpct, 2, cr, cg, cb);
-      cx -= 8 + (int)strlen(cval) * 12;
-      wtext(back, W, H, STRIDE, cx, y + 24, cval, 2, cr, cg, cb);
-      cx -= 8 + (int)strlen(cqty) * 6;
-      wtext(back, W, H, STRIDE, cx, y + 28, cqty, 1, cr, cg, cb);
+      snprintf(cval, sizeof(cval), "$%5d", (int)(pf->crypto_value + 0.5f));
+      snprintf(cqty, sizeof(cqty), "%.5f", pf->crypto_qty);
+
+      wtext(back, W, H, STRIDE, LABEL_X, y + ROW_H, sym, 1, cyan_r, cyan_g, cyan_b);
+      wtext(back, W, H, STRIDE, VAL_X,   y + ROW_H, cval,  2, cr, cg, cb);
+      wtext(back, W, H, STRIDE, DAY_X,   y + ROW_H, cpct,  1, cr, cg, cb);
+      wtext(back, W, H, STRIDE, OV_X,    y + ROW_H, cqty,  1, dim_r, dim_g, dim_b);
     }
+
+    // ---- Row 3: CASH ----
+    char cbuf[16];
+    snprintf(cbuf, sizeof(cbuf), "$%5d", (int)(pf->cash + 0.5f));
+    wtext(back, W, H, STRIDE, LABEL_X, y + 2 * ROW_H, "CASH", 1, cyan_r, cyan_g, cyan_b);
+    wtext(back, W, H, STRIDE, VAL_X,   y + 2 * ROW_H, cbuf,  2, dim_r, dim_g, dim_b);
+    // day/overall blank
   } else {
     wtext(back, W, H, STRIDE, RX - 54, y, "PORTFOLIO", 1, dim_r, dim_g, dim_b);
-    wtext(back, W, H, STRIDE, RX - 42, y + 24, "NO DATA", 1, dim_r, dim_g, dim_b);
+    wtext(back, W, H, STRIDE, RX - 42, y + 16, "NO DATA", 1, dim_r, dim_g, dim_b);
   }
 }
 

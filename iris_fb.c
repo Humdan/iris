@@ -64,6 +64,32 @@ static void led_set(const char *script) {
 #define NS_TOGGLE_W (NS_PILL_W + 20)
 #define NS_TOGGLE_H (NS_PILL_H + 20)
 
+// Running agents for the gyroscope comets. Registry lines, one per session:
+//   A|<c=claude h=hermes>|<session id>|<last active epoch>|<activity 0..1>
+// Written by the Claude Code hook and the Iris Hermes plugin. An agent counts
+// as running for AGENT_IDLE_S after its last activity, fading as it goes quiet.
+#define AGENTS_FILE  "/tmp/iris_agents.txt"
+#define AGENT_IDLE_S 120.0
+static int read_agents(OrgAgentIn *out, int max) {
+    FILE *f = fopen(AGENTS_FILE, "r");
+    if (!f) return 0;
+    char line[256]; int n = 0;
+    time_t wall = time(NULL);
+    while (n < max && fgets(line, sizeof(line), f)) {
+        char kind, id[128]; double last; float a;
+        if (sscanf(line, "A|%c|%127[^|]|%lf|%f", &kind, id, &last, &a) != 4) continue;
+        double age = (double)wall - last;
+        if (age > AGENT_IDLE_S || age < -60) continue;
+        uint32_t h = 2166136261u;
+        for (const char *q = id; *q; q++) { h ^= (uint8_t)*q; h *= 16777619u; }
+        // full activity while recently active, easing down as the agent goes quiet
+        float recency = age < 5 ? 1.0f : expf(-(float)(age - 5) / 40.0f);
+        out[n++] = (OrgAgentIn){ h, kind == 'h' ? 'h' : 'c', a * recency };
+    }
+    fclose(f);
+    return n;
+}
+
 static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec * 1e-9; }
 static float frand(void) { return rand() / (float)RAND_MAX; }
 static float smoothstep(float e0, float e1, float x) { float t = clampf((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); }
@@ -90,7 +116,29 @@ static float heartbeat(float ph) {
 // render loop only SAMPLES it once per frame — never reads the device — so the
 // 60Hz absolute-clock pacing is never blocked by touch I/O.
 // ---------------------------------------------------------------------------
-#define TOUCH_DEV "/dev/input/event4"
+// The touchscreen's event number is NOT stable across boots (it was event4,
+// now it's event0 with the HDMI devices on 1-4), so find it by capability:
+// the first /dev/input/event* that reports multitouch X/Y. IRIS_TOUCH_DEV
+// overrides.
+#define BITS_PER_LONG_ (sizeof(long) * 8)
+static int test_bit_(int bit, const unsigned long *arr) { return (arr[bit / BITS_PER_LONG_] >> (bit % BITS_PER_LONG_)) & 1; }
+static int open_touch_device(char *path, size_t n) {
+    const char *env = getenv("IRIS_TOUCH_DEV");
+    if (env && *env) { snprintf(path, n, "%s", env); return open(path, O_RDONLY); }
+    for (int i = 0; i < 32; i++) {
+        snprintf(path, n, "/dev/input/event%d", i);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+        unsigned long absbits[(ABS_MAX + BITS_PER_LONG_) / BITS_PER_LONG_];
+        memset(absbits, 0, sizeof(absbits));
+        if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits) >= 0 &&
+            test_bit_(ABS_MT_POSITION_X, absbits) && test_bit_(ABS_MT_POSITION_Y, absbits))
+            return fd;
+        close(fd);
+    }
+    snprintf(path, n, "(none)");
+    return -1;
+}
 
 typedef struct {
     pthread_mutex_t m;
@@ -109,12 +157,15 @@ static TouchState touch = { .m = PTHREAD_MUTEX_INITIALIZER, .down = 0, .x = 0, .
 
 static void *touch_thread(void *arg) {
     (void)arg;
-    int tfd = open(TOUCH_DEV, O_RDONLY);
+    char tpath[64];
+    int tfd = open_touch_device(tpath, sizeof(tpath));
     if (tfd < 0) {
-        fprintf(stderr, "touch: open %s failed: %s (gestures disabled)\n", TOUCH_DEV, strerror(errno));
+        fprintf(stderr, "touch: no multitouch device found (%s): %s (gestures disabled)\n", tpath, strerror(errno));
         return NULL;
     }
-    fprintf(stderr, "touch: reading %s\n", TOUCH_DEV);
+    char tname[128] = "?";
+    ioctl(tfd, EVIOCGNAME(sizeof(tname)), tname);
+    fprintf(stderr, "touch: reading %s (%s)\n", tpath, tname);
 
     int cur_x = 0, cur_y = 0;   // accumulated within the current SYN frame
     int have_x = 0, have_y = 0;
@@ -238,8 +289,15 @@ int main(int argc, char **argv) {
     // Night shift CONSOLE state: transcript cache refreshed ~1Hz, plus a brief
     // FIRING feedback timestamp set when the RUN NOW button is tapped.
         NightConsole ns_con; memset(&ns_con, 0, sizeof(ns_con));
+        static NsView ns_view;       // running cron lanes + announced tasks (~1Hz)
         double ns_last_read = 0;     // last transcript read (monotonic)
-        double ns_fire_at   = -1e9;  // time RUN NOW was tapped; FIRING shows for ~2.5s
+        double ns_fire_at   = -1e9;  // time the NIGHT SHIFT button was tapped
+        // Hermes only notices a manual run on its next cron tick (every 60s,
+        // not configurable), then gathers context (~30s) before the agent
+        // starts. Night mode switches on at the tap; the panel shows a
+        // countdown to the tick and then "warming up" until the run is live.
+        #define NS_START_WINDOW 180.0
+        double ns_tick_at   = 0;     // wall-clock epoch of Hermes's last cron tick
         int    ns_running   = 0;     // night shift actively running (fresh transcript mtime)
         int    ns_manual    = 0;     // manual night shift mode toggle (0=off, 1=on)
         int    ns_manual_prev = 0;   // previous manual state for edge-triggered LED
@@ -321,18 +379,20 @@ int main(int argc, char **argv) {
         if (sup != last_seq_up) {
             last_seq_up = sup;
             int mv = abs(upx - gesture_down_x) + abs(upy - gesture_down_y);
+            fprintf(stderr, "touch: up (%d,%d) down (%d,%d) moved %d%s\n", upx, upy,
+                    gesture_down_x, gesture_down_y, mv, mv < 15 ? " -> tap" : "");
             if (mv < 15) {
                 // TAP — hit-test against queue rows / overlay / elsewhere
                 int handled = 0;
                 // Is the large Night shift console currently on screen? It shows
                 // when night mode is active (manual/running) OR the Night shift
                 // job row is selected. RUN NOW lives inside that big panel.
-                int ns_console_showing = ns_manual || ns_running ||
+                int ns_console_showing = ns_manual || ns_running || (t - ns_fire_at < NS_START_WINDOW) ||
                     (sel_job >= 0 && strcmp(stats.names[sel_job], NS_JOB_NAME) == 0);
                 // Top-right NIGHT SHIFT button (padded tap zone). Fires only when
                 // no run is live and it wasn't just tapped (no double starts).
                 if (upx >= NS_RUN_X - 8 && upy < NS_RUN_Y + NS_RUN_H + 10) {
-                    if (!ns_running && t - ns_fire_at > 60.0) {
+                    if (!ns_running && t - ns_fire_at > NS_START_WINDOW) {
                         ns_fire_job();      // fork+exec detached; returns instantly
                         ns_fire_at = t;
                     }
@@ -443,12 +503,29 @@ int main(int argc, char **argv) {
         // Iris turns maroon while night shift is on (eased, ~1s fade either way).
         // ns_manual/ns_running are last frame's values: at most one frame late.
         static float night_w = 0.0f;
-        night_w += ((ns_manual || ns_running ? 1.0f : 0.0f) - night_w) * (1.0f - expf(-3.0f * dt));
+        int ns_starting = !ns_running && (t - ns_fire_at) < NS_START_WINDOW;
+        night_w += ((ns_manual || ns_running || ns_starting ? 1.0f : 0.0f) - night_w) * (1.0f - expf(-3.0f * dt));
         org_frame(back, W, H, STRIDE, ox, oy, escale, global_time, dt, act,
                   yaw, pitch, heartbeat(beat_phase), beat_phase, night_w);
 
         // --- widgets: clock + system stats + agent panel on top of the orb ---
-        if (t - tstats > 1.0) { tstats = t; read_stats(&stats); read_agent_stats(&agent); read_portfolio_stats(&portfolio); ns_running = ns_running_check(); }
+        if (t - tstats > 1.0) {
+            tstats = t; read_stats(&stats); read_agent_stats(&agent); read_portfolio_stats(&portfolio);
+            // Running = a live Night-shift lane from the Hermes plugin (exact),
+            // or the step-log heuristics (fallback while the plugin isn't loaded).
+            read_ns_view(&ns_view);
+            ns_tick_at = read_cron_tick();
+            {
+                OrgAgentIn ag[ORG_AGENTS];
+                int nag = read_agents(ag, ORG_AGENTS);
+                org_set_agents(ag, nag);
+            }
+            int lane_live = 0;
+            for (int i = 0; i < ns_view.nl; i++) if (ns_view.lanes[i].is_ns) lane_live = 1;
+            if (ns_view.open_cards > 0) lane_live = 1;   // shift has queued work between workers
+            ns_running = lane_live || ns_running_check();
+            if (lane_live) ns_fire_at = -1e9;   // run picked up: leave the STARTING state
+        }
         if (sel_job >= stats.njobs) sel_job = -1;   // job vanished from queue
 
         // Locate the Night shift job in the current queue (index or -1).
@@ -458,7 +535,7 @@ int main(int argc, char **argv) {
 
         // Night-shift mode active (manual toggle OR a real run detected) forces the
         // live console open so the transcript is always visible while it works.
-        int ns_mode = (ns_manual || ns_running);
+        int ns_mode = (ns_manual || ns_running || ns_starting);
         // The console is shown when the user tapped the job row, OR whenever
         // night-shift mode is active and we know which row is the Night shift job.
         // (While it runs, the job can drop out of the queue list, so night-shift
@@ -470,7 +547,10 @@ int main(int argc, char **argv) {
                              ? sel_job : ns_job_idx;
 
         // Refresh the Night shift transcript ~1Hz whenever its console is open.
-        if (ns_open && t - ns_last_read > 1.0) { ns_last_read = t; ns_read_transcript(&ns_con); }
+        if (ns_open && t - ns_last_read > 1.0) {
+            ns_last_read = t;
+            ns_read_transcript(&ns_con);
+        }
 
         // --- Session orbs: draw around the main sphere (BACKGROUND layer) ---
         read_session_stats(&sessions, t);
@@ -492,12 +572,20 @@ int main(int argc, char **argv) {
         // --- NIGHT SHIFT trigger, top-right corner (always shown) ---
         // STARTING shows from the tap until the run is detected (up to 60s).
         draw_ns_run_button(back, W, H, STRIDE, ns_running,
-                           !ns_running && t - ns_fire_at < 60.0, ns_pulse);
+                           ns_starting, ns_pulse);
 
         // --- Night shift log (left column) or job detail overlay ---
         if (show_log) {
             int firing = (t - ns_fire_at) < 2.5;   // brief RUN NOW feedback
-            draw_night_log(back, W, H, STRIDE, &ns_con, firing, ns_manual, ns_pulse);
+            // Task view when lanes are known; raw step log as the fallback
+            // (manual mode with nothing running, or plugin not yet reloaded).
+            int have_view = ns_view.nl > 0 || ns_view.open_cards > 0 || ns_view.nd > 0;
+            if (ns_starting && !have_view)
+                draw_night_starting(back, W, H, STRIDE, ns_tick_at, ns_pulse);
+            else if (have_view)
+                draw_night_tasks(back, W, H, STRIDE, &ns_view, ns_manual, ns_pulse);
+            else
+                draw_night_log(back, W, H, STRIDE, &ns_con, firing, ns_manual, ns_pulse);
         } else if (sel_job >= 0) {
             draw_job_detail(back, W, H, STRIDE, &stats, sel_job);
         }

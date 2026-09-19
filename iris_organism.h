@@ -282,6 +282,122 @@ static void org_composite(uint16_t *back, int W, int H, int STRIDE, int ox, int 
 
 static inline float org_frac(float x) { return x - floorf(x); }
 
+// ---- Agent gyroscope ----------------------------------------------------
+// A permanent armature of three tilted orbital rings (Iris's skeleton, always
+// present, slowly precessing). Each running agent is a comet riding one of
+// the rings: Claude = white-hot head / cyan tail, Hermes = orange. A comet's
+// speed and tail length follow its agent's activity; the more total work, the
+// brighter and faster the whole frame turns.
+#define ORG_GYRO_RINGS 3
+#define ORG_AGENTS     8
+typedef struct { uint32_t id; char kind; float activity; } OrgAgentIn;   // kind 'c' claude, 'h' hermes
+typedef struct { uint32_t id; char kind; float act, vis, pos; int ring, alive; } OrgComet;
+static OrgComet org_comets[ORG_AGENTS];
+static int      org_ncomets = 0;
+static const float org_gyro_r[ORG_GYRO_RINGS] = { 1.00f, 0.92f, 1.04f };
+static const float org_gyro_tilt[ORG_GYRO_RINGS][2] = { { 1.20f, 0.25f }, { 0.40f, 2.00f }, { 2.25f, -1.00f } };
+static float org_gyro_prec[ORG_GYRO_RINGS];
+
+// Feed the current agent list (call ~1 Hz). Comets are matched by id so they
+// keep their place; new agents fade in, vanished ones fade out.
+static void org_set_agents(const OrgAgentIn *in, int n) {
+  for (int k = 0; k < org_ncomets; k++) org_comets[k].alive = 0;
+  for (int i = 0; i < n; i++) {
+    OrgComet *c = NULL;
+    for (int k = 0; k < org_ncomets; k++) if (org_comets[k].id == in[i].id) { c = &org_comets[k]; break; }
+    if (!c) {
+      if (org_ncomets >= ORG_AGENTS) continue;
+      c = &org_comets[org_ncomets++];
+      int load[ORG_GYRO_RINGS] = { 0 };
+      for (int k = 0; k < org_ncomets - 1; k++) load[org_comets[k].ring]++;
+      int best = 0;
+      for (int r = 1; r < ORG_GYRO_RINGS; r++) if (load[r] < load[best]) best = r;
+      *c = (OrgComet){ in[i].id, in[i].kind, 0, 0, (in[i].id % 628) / 100.0f, best, 1 };
+    }
+    c->alive = 1; c->kind = in[i].kind;
+    c->act = in[i].activity < 0 ? 0 : in[i].activity > 1 ? 1 : in[i].activity;
+  }
+}
+
+// Additive splat with an explicit color (not the body palette).
+static inline void org_plot_rgb(const OrgProj *pj, float x, float y, float z, float r, float g, float b) {
+  float f = 4.0f / (4.0f - z);
+  float bx = pj->half + x * f * pj->R, by = pj->half - y * f * pj->R;
+  float dc = 0.35f + 0.65f * (0.5f + 0.5f * z);
+  org_splat(bx, by, r * dc, g * dc, b * dc);
+  org_splat(bx + 0.6f, by + 0.6f, r * dc * 0.5f, g * dc * 0.5f, b * dc * 0.5f);
+}
+
+static void org_gyro(const OrgProj *pj, const M3 *G, float R, float dt, float act, float night) {
+  // ease comets, drop fully faded ones
+  float busy = 0;
+  int out = 0;
+  for (int k = 0; k < org_ncomets; k++) {
+    OrgComet *c = &org_comets[k];
+    c->vis += ((c->alive ? 1.0f : 0.0f) - c->vis) * (1.0f - expf(-2.0f * dt));
+    if (!c->alive && c->vis < 0.01f) continue;
+    busy += c->act * c->vis;
+    org_comets[out++] = *c;
+  }
+  org_ncomets = out;
+  float b = fminf(busy / 2.0f, 1.0f);                 // 0 idle .. 1 (two fully busy agents)
+
+  // the armature: faint rings with tick marks, tinted like the body
+  float tint[3] = { 0.55f + 0.40f * night, 0.78f - 0.55f * night, 1.0f - 0.75f * night };   // whiter than the body
+  M3 RM[ORG_GYRO_RINGS];
+  for (int r = 0; r < ORG_GYRO_RINGS; r++) {
+    org_gyro_prec[r] += (0.025f + 0.16f * b + 0.03f * act) * dt * (r & 1 ? -1.0f : 1.0f);
+    RM[r] = m3_mul(*G, m3_mul(m3_rz(org_gyro_tilt[r][1] + org_gyro_prec[r]), m3_rx(org_gyro_tilt[r][0])));
+    float rr = org_gyro_r[r];
+    int n = (int)(6.2831853f * rr * R / 1.3f);
+    float I0 = 0.16f + 0.16f * b;
+    for (int k = 0; k < n; k++) {
+      float a = 6.2831853f * k / n;
+      float tick = fmodf(a, 6.2831853f / 24.0f) < 0.022f ? 3.0f : 1.0f;   // 24 tick marks
+      float p[3]; org_xf(&RM[r], cosf(a) * rr, 0, sinf(a) * rr, p);
+      float I = I0 * tick;
+      org_plot_rgb(pj, p[0], p[1], p[2], I * tint[0], I * tint[1], I * tint[2]);
+    }
+  }
+
+  // comets
+  for (int k = 0; k < org_ncomets; k++) {
+    OrgComet *c = &org_comets[k];
+    c->pos += (0.35f + 1.8f * c->act) * dt;
+    float rr = org_gyro_r[c->ring];
+    float tail = 0.45f + 1.4f * c->act;                // radians of tail
+    int n = (int)(tail * rr * R / 1.0f) + 4;
+    float cr, cg, cb, hr, hg, hb;                       // tail color, head (hot) color
+    if (c->kind == 'h') { cr = 1.00f; cg = 0.48f; cb = 0.08f; hr = 1.0f; hg = 0.85f; hb = 0.55f; }
+    else                { cr = 0.30f; cg = 0.80f; cb = 1.00f; hr = 0.85f; hg = 0.95f; hb = 1.0f; }
+    float V = c->vis * (0.55f + 0.45f * c->act);
+    for (int i = 0; i < n; i++) {
+      float u = (float)i / n;                            // 0 head .. 1 tail end
+      float a = c->pos - u * tail;
+      float p[3]; org_xf(&RM[c->ring], cosf(a) * rr, 0, sinf(a) * rr, p);
+      float w = (1.0f - u); w = w * w;
+      float I = V * 2.0f * w;
+      float h = u < 0.10f ? 1.0f - u / 0.10f : 0.0f;     // white-hot near the head
+      float rr_ = I * (cr + h * hr), gg_ = I * (cg + h * hg), bb_ = I * (cb + h * hb);
+      // ~3px wide near the head, tapering to 1px at the tail end
+      float wpx = (1.0f - u) * 1.1f / R;
+      org_plot_rgb(pj, p[0], p[1], p[2], rr_, gg_, bb_);
+      org_plot_rgb(pj, p[0] + wpx, p[1] + wpx, p[2], rr_ * 0.6f, gg_ * 0.6f, bb_ * 0.6f);
+      org_plot_rgb(pj, p[0] - wpx, p[1] - wpx, p[2], rr_ * 0.6f, gg_ * 0.6f, bb_ * 0.6f);
+    }
+    // glowing head
+    float p[3]; org_xf(&RM[c->ring], cosf(c->pos) * rr, 0, sinf(c->pos) * rr, p);
+    for (int ring = 1; ring <= 3; ring++) {           // soft 3-layer glow ~4px radius
+      float d = ring * 1.3f / R, k = V * (1.6f / ring);
+      for (int j = 0; j < 8; j++) {
+        float ja = j * 0.7853982f + ring * 0.4f;
+        org_plot_rgb(pj, p[0] + cosf(ja) * d, p[1] + sinf(ja) * d, p[2],
+                     k * (cr + hr), k * (cg + hg), k * (cb + hb));
+      }
+    }
+  }
+}
+
 // Draw one frame of the organism into `back`, centered at (ox, oy).
 //   R          on-screen radius of the outer shell (px), incl. breathing
 //   t, dt      time (s) and frame delta
@@ -453,6 +569,9 @@ static void org_frame(uint16_t *back, int W, int H, int STRIDE, float ox, float 
         p[0] += k * (gold[0] + 0.5f * org_hotk[0]); p[1] += k * (gold[1] + 0.5f * org_hotk[1]); p[2] += k * (gold[2] + 0.5f * org_hotk[2]);
       }
   }
+
+  // --- agent gyroscope: armature rings + one comet per running agent ---
+  org_gyro(&pj, &G, R, dt, act, night);
 
   // --- embers: sparks thrown off the surface when busy ---
   {

@@ -14,6 +14,20 @@ import os
 import threading
 import time
 
+try:   # live "what is autonomous Hermes doing" lanes for the LCD (see ns_lanes.py)
+    from . import ns_lanes as _lanes
+except Exception:  # never let the LCD break Hermes
+    _lanes = None
+
+
+def _lane(fn, *a) -> None:
+    if _lanes is None:
+        return
+    try:
+        getattr(_lanes, fn)(*a)
+    except Exception:
+        pass
+
 _STATE_FILE = os.environ.get("IRIS_STATE_FILE", "/tmp/iris_state")
 _TASK_FILE = os.environ.get("IRIS_TASK_FILE", "/tmp/iris_task")
 # Live step log tailed by the iris console during night-shift runs. Each tool
@@ -227,6 +241,7 @@ def _on_pre_tool_call(tool_name: str = "", args=None, **_kw) -> None:
     # Stream a readable step line to the night-shift live log (no-op otherwise).
     hint = _arg_hint(tool_name, args if isinstance(args, dict) else {})
     _live_append(f"{label}: {hint}" if hint else label)
+    _lane("step", _kw.get("session_id") or "", f"{label}: {hint}" if hint else label)
 
 
 def _on_post_tool_call(**_kw) -> None:
@@ -234,6 +249,7 @@ def _on_post_tool_call(**_kw) -> None:
 
 
 def _on_session_start(**_kw) -> None:
+    _lane("open_lane", _kw.get("session_id") or "")
     _ensure_writer()
     _bump(0.3)
     _live_reset()
@@ -250,6 +266,7 @@ def _on_session_end(**_kw) -> None:
     # Always leave a closing line so even a no-op / [SILENT] run shows it ran.
     # Keep the mtime fresh for ~a few more seconds of "just finished" banner.
     _live_append("night shift finished")
+    _lane("close_lane", _kw.get("session_id") or "")
 
 
 def register(ctx) -> None:
