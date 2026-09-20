@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""lcd-shot [out.png] [--crop x0,y0,x1,y1]: save what the Iris LCD shows right now as a PNG.
+"""lcd-shot [out.png] [--crop x0,y0,x1,y1] [--from raw]: save the Iris LCD as a PNG.
 
-Reads /dev/fb0 (800x480 RGB565). Needs the `video` group. Default output:
-/tmp/lcd-<time>.png. Prints the path.
+Reads /dev/fb0 (800x480 RGB565; needs the `video` group), or with --from a raw
+frame written by `IRIS_SNAPSHOT=<raw> ./iris_fb` (preview a build without
+touching the live screen). Default output: /tmp/lcd-<time>.png. Prints the path.
 """
 import struct, sys, time, zlib
 
 W, H = 800, 480
+src = "/dev/fb0"
+if "--from" in sys.argv:
+    i = sys.argv.index("--from"); src = sys.argv[i + 1]; del sys.argv[i:i + 2]
 args = [a for a in sys.argv[1:] if not a.startswith("--crop")]
 crop = (0, 0, W, H)
 for i, a in enumerate(sys.argv):
@@ -16,7 +20,7 @@ for i, a in enumerate(sys.argv):
         if not a.count("=") and val in args:
             args.remove(val)
 out = args[0] if args else time.strftime("/tmp/lcd-%H%M%S.png")
-with open("/dev/fb0", "rb") as f:
+with open(src, "rb") as f:
     d = f.read(W * H * 2)
 x0, y0, x1, y1 = crop
 rows = []
