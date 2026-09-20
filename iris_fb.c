@@ -227,25 +227,38 @@ int main(int argc, char **argv) {
     // turns overwriting each other's frames (heavy flicker). A second copy
     // (e.g. both the system and the user iris.service) waits here as a quiet
     // standby and takes over only if the running one exits.
-    int lock_fd = open("/tmp/iris_fb.lock", O_RDWR | O_CREAT, 0666);
+    // Preview mode: IRIS_SNAPSHOT=<file> renders ~2s off-screen (no framebuffer,
+    // no lock, no touch) and writes the last frame as raw RGB565 800x480 to
+    // <file>; view it with `lcd-shot --from <file> out.png`. Safe to run while
+    // the live renderer owns the screen, so layout changes can be checked
+    // without restarting Iris. IRIS_SNAPSHOT_FRAMES overrides the frame count.
+    const char *snapshot = getenv("IRIS_SNAPSHOT");
+    int snap_frames = getenv("IRIS_SNAPSHOT_FRAMES") ? atoi(getenv("IRIS_SNAPSHOT_FRAMES")) : 120;
+
+    int lock_fd = snapshot ? -1 : open("/tmp/iris_fb.lock", O_RDWR | O_CREAT, 0666);
     if (lock_fd >= 0 && flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
         fprintf(stderr, "iris_fb: another instance owns the screen; waiting as standby\n");
         while (running && flock(lock_fd, LOCK_EX) < 0 && errno == EINTR) {}
         if (!running) return 0;
     }
 
-    int fd = open("/dev/fb0", O_RDWR);
-    if (fd < 0) { perror("open /dev/fb0"); return 1; }
-
-    struct fb_var_screeninfo v;
-    struct fb_fix_screeninfo f;
-    ioctl(fd, FBIOGET_VSCREENINFO, &v);
-    ioctl(fd, FBIOGET_FSCREENINFO, &f);
-
-    int W = v.xres, H = v.yres, BPP = v.bits_per_pixel, STRIDE = f.line_length;
+    int fd = -1, W = 800, H = 480, BPP = 16, STRIDE = 1600;
+    uint8_t *fb_raw;
     size_t fbsize = (size_t)STRIDE * H;
-    uint8_t *fb_raw = mmap(NULL, fbsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (fb_raw == MAP_FAILED) { perror("mmap"); return 1; }
+    if (snapshot) {
+        fb_raw = calloc(1, fbsize);
+    } else {
+        fd = open("/dev/fb0", O_RDWR);
+        if (fd < 0) { perror("open /dev/fb0"); return 1; }
+        struct fb_var_screeninfo v;
+        struct fb_fix_screeninfo f;
+        ioctl(fd, FBIOGET_VSCREENINFO, &v);
+        ioctl(fd, FBIOGET_FSCREENINFO, &f);
+        W = v.xres; H = v.yres; BPP = v.bits_per_pixel; STRIDE = f.line_length;
+        fbsize = (size_t)STRIDE * H;
+        fb_raw = mmap(NULL, fbsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (fb_raw == MAP_FAILED) { perror("mmap"); return 1; }
+    }
     uint16_t *fb = (uint16_t *)fb_raw;
     uint8_t *back_raw = malloc(fbsize);
 
@@ -274,7 +287,7 @@ int main(int argc, char **argv) {
 
     // --- touch: spawn the reader thread; render loop only samples shared state ---
     pthread_t tid;
-    int have_touch_thread = (pthread_create(&tid, NULL, touch_thread, NULL) == 0);
+    int have_touch_thread = !snapshot && (pthread_create(&tid, NULL, touch_thread, NULL) == 0);
     if (!have_touch_thread) fprintf(stderr, "touch: pthread_create failed (gestures disabled)\n");
 
     // gesture / interaction state (owned by the render loop)
@@ -593,6 +606,15 @@ int main(int argc, char **argv) {
         // --- blit atomically ---
         memcpy(fb_raw, back_raw, fbsize);
 
+        if (snapshot && --snap_frames <= 0) {
+            FILE *sf = fopen(snapshot, "wb");
+            if (!sf) { perror(snapshot); return 1; }
+            fwrite(fb_raw, 1, fbsize, sf);
+            fclose(sf);
+            fprintf(stderr, "iris_fb: snapshot written to %s\n", snapshot);
+            return 0;
+        }
+
         frames++;
         if (t - tfps > 5) {
             fprintf(stderr, "fps %.1f act %.2f\n", frames / (t - tfps), act);
@@ -610,7 +632,6 @@ int main(int argc, char **argv) {
     if (have_touch_thread) pthread_join(tid, NULL);
     memset(fb_raw, 0, fbsize);
     free(back_raw);
-    munmap(fb_raw, fbsize);
-    close(fd);
+    if (fd >= 0) { munmap(fb_raw, fbsize); close(fd); }
     return 0;
 }
