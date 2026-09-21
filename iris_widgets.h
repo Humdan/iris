@@ -6,11 +6,14 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+
+#include "iris_layout.h"   // LAY: dashboard-owned positions / visibility
 
 // ---- 5x7 bitmap font: ASCII 32..90 (space..Z) + a few punctuation. ----
 // Each glyph is 5 columns x 7 rows, stored as 5 bytes (low 7 bits = rows top->bottom).
@@ -128,6 +131,16 @@ static int wtext(uint16_t *back, int W, int H, int STRIDE, int x, int y,
   return cx;
 }
 
+// Right-aligned wtext: the string's last lit pixel column lands on x_right.
+// A glyph is 5 columns wide and each char advances 6, so a string of n chars
+// measures n*6-1 columns before scaling (the trailing space is not drawn).
+static int wtext_r(uint16_t *back, int W, int H, int STRIDE, int x_right, int y,
+                   const char *s, int scale, float r, float g, float b) {
+  int w = (int)strlen(s) * 6 * scale - scale;
+  if (w < 0) w = 0;
+  return wtext(back, W, H, STRIDE, x_right - w, y, s, scale, r, g, b);
+}
+
 // Simple horizontal bar meter: track + fill by pct (0..100), colored by level.
 static void wbar(uint16_t *back, int W, int H, int STRIDE, int x, int y,
                  int w, int h, float pct) {
@@ -148,7 +161,10 @@ static void wbar(uint16_t *back, int W, int H, int STRIDE, int x, int y,
 }
 
 // ---- cron job queue (replaces tool-call feed) ----
-#define CRON_MAX 6
+// Parse more jobs than fit on screen so the queue can actually be scrolled;
+// the visible window is LAY.queue_rows. Keep in sync with server.py's
+// LCD_QUEUE_MAX, which feeds the web mirror the same list.
+#define CRON_MAX 12
 typedef struct {
   char clock[16];
   char date[24];
@@ -160,7 +176,9 @@ typedef struct {
   char schedule[CRON_MAX][40];    // human schedule display, e.g. "every day at 7am"
   char laststat[CRON_MAX][16];    // last_status text: ok / error / (none)
   char nextiso[CRON_MAX][40];     // raw next_run_at ISO string
+  char bases[CRON_MAX][64];       // grouping key: name minus a trailing time slot
   int  is_ns[CRON_MAX];           // 1 if this is a night-shift task (drawn red in queue)
+  int  copies[CRON_MAX];          // recurring jobs folded into this row (1 = just itself)
 } FeedStats;
 
 // Grab the string value of "key":"...": into out (bounded). Returns 1 on hit.
@@ -180,22 +198,50 @@ static int json_str(const char *start, const char *end, const char *key,
 }
 
 // Turn an ISO8601-with-offset next_run into a compact "in 2H" / "in 15M" label.
-static void when_label(const char *iso, char *out, int outsz) {
-  if (!iso[0]) { snprintf(out, outsz, "-"); return; }
+// Seconds until an ISO next_run_at. WHEN_NEVER when it can't be parsed, so an
+// unschedulable job never wins a "which of these recurring jobs is next" test.
+#define WHEN_NEVER 2000000000L
+static long when_secs(const char *iso) {
+  if (!iso || !iso[0]) return WHEN_NEVER;
   struct tm tm; memset(&tm, 0, sizeof(tm));
   int off_h = 0, off_m = 0; char sign = '+';
   int n = sscanf(iso, "%d-%d-%dT%d:%d:%d%c%d:%d",
                  &tm.tm_year,&tm.tm_mon,&tm.tm_mday,&tm.tm_hour,&tm.tm_min,&tm.tm_sec,
                  &sign,&off_h,&off_m);
-  if (n < 6) { snprintf(out, outsz, "-"); return; }
+  if (n < 6) return WHEN_NEVER;
   tm.tm_year -= 1900; tm.tm_mon -= 1;
   time_t local = timegm(&tm);   // treat parsed wall-time as UTC...
   if (n >= 8) { long off = (off_h*3600 + off_m*60) * (sign=='-'?1:-1); local += off; } // ...then correct by offset -> real UTC
-  long d = (long)(local - time(NULL));
+  return (long)(local - time(NULL));
+}
+
+static void when_label(const char *iso, char *out, int outsz) {
+  long d = when_secs(iso);
+  if (d == WHEN_NEVER) { snprintf(out, outsz, "-"); return; }
   if (d < 0) { snprintf(out, outsz, "DUE"); return; }
   if (d < 3600) snprintf(out, outsz, "IN %ldM", d/60);
   else if (d < 86400) snprintf(out, outsz, "IN %ldH", d/3600);
   else snprintf(out, outsz, "IN %ldD", d/86400);
+}
+
+// A recurring job split across time slots ("Hyper Portfolio 08:30", "... 10:00")
+// is five cron entries doing one piece of work -- cron cannot express a 90
+// minute cadence in one expression, so it has to be split. On a six-row panel
+// that buries everything else, so rows are grouped by the name with a trailing
+// clock time or bare number removed, and only the next occurrence is drawn.
+static void base_name(const char *name, char *out, int outsz) {
+  snprintf(out, outsz, "%s", name ? name : "");
+  char *sp = strrchr(out, ' ');
+  if (!sp || sp == out) return;
+  const char *tok = sp + 1;
+  if (!*tok) return;
+  int digits = 0, colons = 0, other = 0;
+  for (const char *p = tok; *p; p++) {
+    if (*p >= '0' && *p <= '9') digits++;
+    else if (*p == ':') colons++;
+    else other++;
+  }
+  if (other == 0 && colons <= 1 && digits > 0) *sp = 0;   // " 08:30" / " 2"
 }
 
 // True if a job's FULL name denotes a night-shift task: exactly the recurring
@@ -231,10 +277,23 @@ static void read_stats(FeedStats *st) {
   for (char *p = st->date; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32;
 
   st->njobs = 0;
-  FILE *f = fopen("/home/humdan/.hermes/cron/jobs.json", "r");
+  const char *jobs_path = "/home/humdan/.hermes/cron/jobs.json";
+  FILE *f = fopen(jobs_path, "r");
   if (!f) return;
-  static char buf[16384];
-  size_t nlen = fread(buf, 1, sizeof(buf) - 1, f); buf[nlen] = 0; fclose(f);
+  // The file grows with every job added (46KB as of 2026-09-20). A fixed
+  // buffer silently truncated it, so the panel showed only the jobs that fit
+  // in the first 16KB -- the queue looked short for no visible reason. Grow to
+  // whatever the file actually is; the buffer is reused across the 1Hz reads.
+  static char *buf = NULL;
+  static size_t cap = 0;
+  struct stat jst;
+  size_t want = (stat(jobs_path, &jst) == 0 && jst.st_size > 0) ? (size_t)jst.st_size + 1 : 65536;
+  if (want > cap) {
+    char *nb = (char *)realloc(buf, want);
+    if (!nb) { fclose(f); return; }
+    buf = nb; cap = want;
+  }
+  size_t nlen = fread(buf, 1, cap - 1, f); buf[nlen] = 0; fclose(f);
 
   // iterate job objects by locating each "id" then bounding to the next "id".
   const char *p = buf;
@@ -261,7 +320,27 @@ static void read_stats(FeedStats *st) {
       continue;
     }
 
-    strncpy(st->names[st->njobs], name, 21); st->names[st->njobs][21] = 0;
+    // Same work on a different slot? Keep one row, showing whichever fires next.
+    char base[128]; base_name(name, base, sizeof(base));
+    int merged = -1;
+    for (int k = 0; k < st->njobs; k++) {
+      if (strncmp(st->bases[k], base, sizeof(st->bases[k]) - 1) == 0) { merged = k; break; }
+    }
+    if (merged >= 0) {
+      st->copies[merged]++;
+      if (when_secs(when_iso) < when_secs(st->nextiso[merged])) {
+        when_label(when_iso, st->when[merged], sizeof(st->when[merged]));
+        strncpy(st->nextiso[merged], when_iso, 39); st->nextiso[merged][39] = 0;
+        strncpy(st->schedule[merged], sched[0] ? sched : "-", 39); st->schedule[merged][39] = 0;
+      }
+      if (status[0] && strncmp(status, "error", 5) == 0) st->status[merged] = 1;
+      p = end;
+      continue;
+    }
+    strncpy(st->bases[st->njobs], base, sizeof(st->bases[0]) - 1);
+    st->bases[st->njobs][sizeof(st->bases[0]) - 1] = 0;
+    st->copies[st->njobs] = 1;
+    strncpy(st->names[st->njobs], base, 21); st->names[st->njobs][21] = 0;
     when_label(when_iso, st->when[st->njobs], sizeof(st->when[st->njobs]));
     strncpy(st->schedule[st->njobs], sched[0] ? sched : "-", 39); st->schedule[st->njobs][39] = 0;
     strncpy(st->laststat[st->njobs], status[0] ? status : "NONE", 15); st->laststat[st->njobs][15] = 0;
@@ -278,11 +357,14 @@ static void read_stats(FeedStats *st) {
 }
 
 // --- queue panel layout constants (shared with touch hit-testing in iris_fb.c) ---
-#define QUEUE_LX      12     // left column x
-#define QUEUE_LY      116    // first row baseline y
-#define QUEUE_ROW_H   44     // pixels per job row
-#define QUEUE_PANEL_W 260    // touch-active width of the left column
-#define QUEUE_VISIBLE 6      // max rows drawn at once
+// Left-column geometry. LX/LY/VISIBLE are dashboard-owned (iris_layout.h) and
+// are read fresh every frame, so moving the queue from the web UI moves its
+// touch zones with it -- the hit-tests in iris_fb.c use these same macros.
+#define QUEUE_LX      ((int)LAY.queue_x)
+#define QUEUE_LY      ((int)LAY.queue_y)
+#define QUEUE_ROW_H   44                      // pixels per job row
+#define QUEUE_PANEL_W ((int)LAY.queue_x + 248) // touch-active width of the column
+#define QUEUE_VISIBLE ((int)LAY.queue_rows)   // max rows drawn at once
 
 // Render clock (top) + cron job queue (left column).
 // scroll: number of jobs scrolled off the top (already clamped by caller).
@@ -294,13 +376,16 @@ static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const FeedSta
   const float ok_r = 0.25f, ok_g = 0.85f, ok_b = 0.45f;
   const float err_r = 0.95f, err_g = 0.30f, err_b = 0.30f;
 
-  // --- top: big clock centered; date under it ---
-  int tw = (int)strlen(st->clock) * 6 * 4;
-  wtext(back, W, H, STRIDE, (W - tw) / 2, 10, st->clock, 4, cyan_r, cyan_g, cyan_b);
-  int dw = (int)strlen(st->date) * 6 * 2;
-  wtext(back, W, H, STRIDE, (W - dw) / 2, 44, st->date, 2, dim_r, dim_g, dim_b);
+  // --- top: big clock centered on LAY.clock_x; date under it ---
+  if (LAY.clock_enabled) {
+    int cx = (int)LAY.clock_x, cy = (int)LAY.clock_y;
+    int tw = (int)strlen(st->clock) * 6 * 4;
+    wtext(back, W, H, STRIDE, cx - tw / 2, cy, st->clock, 4, cyan_r, cyan_g, cyan_b);
+    int dw = (int)strlen(st->date) * 6 * 2;
+    wtext(back, W, H, STRIDE, cx - dw / 2, cy + 34, st->date, 2, dim_r, dim_g, dim_b);
+  }
 
-  if (!show_queue) return;   // night-shift log owns the left column
+  if (!show_queue || !LAY.queue_enabled) return;   // hidden, or the night-shift log owns the column
 
   // --- left column: cron QUEUE ---
   int lx = QUEUE_LX, ly = QUEUE_LY;
@@ -336,7 +421,10 @@ static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const FeedSta
     float ng = is_ns ? err_g : cyan_g;
     float nb = is_ns ? err_b : cyan_b;
     wtext(back, W, H, STRIDE, lx + 14, yy, st->names[i], 2, nr, ng, nb);
-    wtext(back, W, H, STRIDE, lx + 14, yy + 18, st->when[i], 1, dim_r, dim_g, dim_b);
+    char whenbuf[28];
+    if (st->copies[i] > 1) snprintf(whenbuf, sizeof(whenbuf), "%s  X%d", st->when[i], st->copies[i]);
+    else snprintf(whenbuf, sizeof(whenbuf), "%s", st->when[i]);
+    wtext(back, W, H, STRIDE, lx + 14, yy + 18, whenbuf, 1, dim_r, dim_g, dim_b);
   }
   // scroll affordance: little up/down chevrons if more jobs exist off-screen
   if (scroll > 0)
@@ -1133,24 +1221,27 @@ static void read_agent_stats(AgentStats *a) {
   }
 }
 
-// ---- Paper-portfolio snapshot, refreshed via a tiny cache file the C loop reads
-// cheaply (~1Hz, same cadence as AgentStats). The cache is written by a small
-// wrapper script (see scripts/portfolio-cache.sh) that shells ledger.py status
-// -- keeps the render loop free of subprocess spawns. Format (one line,
-// pipe-delimited): "total|pnl_pct|day_pnl_pct|crypto_symbol|crypto_qty|crypto_value|crypto_pnl_pct|stock_value|cash".
+// ---- Paper-portfolio snapshot, refreshed via a tiny cache file the C loop
+// reads cheaply (~1Hz, same cadence as AgentStats). The cache is written every
+// 5 minutes by ~/.hermes/scripts/portfolio-cache.sh, which merges the TWO
+// books the paper money lives in -- the stock ledger and the crypto ledger,
+// $1000 of basis each -- so the headline here is the whole portfolio, not half
+// of it. Format: one "key=value" per line; unknown keys are ignored, so the
+// script can grow fields without breaking this reader.
 typedef struct {
-  int have;         // 1 if cache file present and parsed
-  float total;       // total portfolio value in USD
-  float pnl_pct;      // % change since $1000 start (overall)
-  float day_pnl_pct;  // % change vs previous day's close
-  // Crypto fields (optional, only present if holding crypto)
-  char crypto_symbol[16];  // e.g., "X:BTC"
-  float crypto_qty;        // quantity held
-  float crypto_value;      // USD value
-  float crypto_pnl_pct;    // % P&L on crypto position
-  // Stock and cash fields
-  float stock_value;       // USD value of non-crypto positions
-  float cash;              // USD cash balance
+  int have;            // 1 if cache file present and parsed
+  float total;         // combined value of both books, USD
+  float basis;         // combined starting cash (what was invested)
+  float pnl_pct;       // % change vs basis, all time
+  float day_pnl_pct;   // % change vs the previous close of both books
+  float stock_value;   // stock book: total value (positions + its cash)
+  float stock_pct;     // stock book: % vs its own starting cash, all time
+  float stock_day;     // stock book: % vs its own previous close
+  float stock_cash;    // stock book: idle cash
+  float crypto_value;  // crypto book: total value (positions + its cash)
+  float crypto_pct;    // crypto book: % vs its own starting cash, all time
+  float crypto_day;    // crypto book: % vs its own previous close
+  float crypto_cash;   // crypto book: idle cash
 } PortfolioStats;
 
 
@@ -1430,25 +1521,22 @@ static void read_portfolio_stats(PortfolioStats *p) {
   memset(p, 0, sizeof(*p));
   FILE *f = fopen("/tmp/iris_portfolio", "r");
   if (!f) return;
-  char buf[256] = {0};
-  if (fgets(buf, sizeof(buf) - 1, f)) {
-    float total = 0, pct = 0, day_pct = 0, qty = 0, val = 0, cpct = 0, stock = 0, cash = 0;
-    char sym[16] = {0};
-    // New format: total|pnl_pct|day_pnl_pct|symbol|qty|value|pnl_pct|stock_value|cash
-    int n = sscanf(buf, "%f|%f|%f|%15[^|]|%f|%f|%f|%f|%f", &total, &pct, &day_pct, sym, &qty, &val, &cpct, &stock, &cash);
-    if (n >= 3) {
-      p->have = 1; p->total = total; p->pnl_pct = pct; p->day_pnl_pct = day_pct;
-      if (n >= 7 && sym[0]) {
-        strncpy(p->crypto_symbol, sym, sizeof(p->crypto_symbol) - 1);
-        p->crypto_qty = qty;
-        p->crypto_value = val;
-        p->crypto_pnl_pct = cpct;
-      }
-      if (n >= 9) {
-        p->stock_value = stock;
-        p->cash = cash;
-      }
-    }
+  char line[128];
+  while (fgets(line, sizeof(line), f)) {
+    char key[32]; float v;
+    if (sscanf(line, "%31[^=]=%f", key, &v) != 2) continue;
+    if      (!strcmp(key, "total"))        { p->total = v; p->have = 1; }
+    else if (!strcmp(key, "basis"))          p->basis = v;
+    else if (!strcmp(key, "pnl_pct"))        p->pnl_pct = v;
+    else if (!strcmp(key, "day_pct"))        p->day_pnl_pct = v;
+    else if (!strcmp(key, "stock_value"))    p->stock_value = v;
+    else if (!strcmp(key, "stock_pct"))      p->stock_pct = v;
+    else if (!strcmp(key, "stock_day"))      p->stock_day = v;
+    else if (!strcmp(key, "stock_cash"))     p->stock_cash = v;
+    else if (!strcmp(key, "crypto_value"))   p->crypto_value = v;
+    else if (!strcmp(key, "crypto_pct"))     p->crypto_pct = v;
+    else if (!strcmp(key, "crypto_day"))     p->crypto_day = v;
+    else if (!strcmp(key, "crypto_cash"))    p->crypto_cash = v;
   }
   fclose(f);
 }
@@ -1457,7 +1545,7 @@ static void read_portfolio_stats(PortfolioStats *p) {
 // NIGHT pill in the bottom panel (COL2, second row). iris_fb.c pads this for
 // its tap zone, so keep them in sync through these macros.
 #define NS_PILL_X     282
-#define NS_PILL_Y(H)  ((H) - 58 + 22)
+#define NS_PILL_Y(H)  ((int)LAY.panel_y + 34)   // rides with the panel
 #define NS_PILL_W     64
 #define NS_PILL_H     16
 
@@ -1467,7 +1555,7 @@ static void draw_agent_panel(uint16_t *back, int W, int H, int STRIDE, const Age
   const float ok_r = 0.25f, ok_g = 0.85f, ok_b = 0.45f;
   const float bad_r = 0.95f, bad_g = 0.30f, bad_b = 0.30f;
   char buf[48];
-  int y = H - 70;   // panel top (moved up 12px from 58 to avoid bottom bezel clip)
+  int y = (int)LAY.panel_y;   // panel top, dashboard-owned (default H-70: clear of the bezel)
 
   // Clear panel background (dark semi-transparent)
   wfill(back, W, H, STRIDE, 0, y - 8, W, 66, 0.02f, 0.03f, 0.05f);
@@ -1541,71 +1629,82 @@ static void draw_agent_panel(uint16_t *back, int W, int H, int STRIDE, const Age
   else snprintf(buf, sizeof(buf), "%sSEEN %dH", a->task_label[0] ? "WORKING " : "", ls / 3600);
   wtext(back, W, H, STRIDE, COL3, y + 26, buf, 1, dim_r, dim_g, dim_b);
 
-  // ====== COL 4: PORTFOLIO — compact aligned 3-row table ======
-  const int RX = W - 8;    // right margin
+  // ====== COL 4: PORTFOLIO — stacked money table, right-aligned ======
+  // A self-contained card on the right of the panel, fenced off by a vertical
+  // rule. It reads top-down: the headline total with its day / all-time P&L,
+  // then the holdings that add up to that total. Every dollar figure shares
+  // one right edge so the column lines up, and only percentages are colored,
+  // so color always means P&L and never just "this is a number". Everything
+  // stays inside the panel fill (no text floating over the organism above).
+  const int PF_L    = (int)LAY.portfolio_x;  // left edge of the card, dashboard-owned
+  const int PF_R    = PF_L + 290;            // right edge every money figure aligns to
+  const int PF_RULE = PF_L - 14;   // vertical separator from COL3
+  const int PF_QTY  = PF_L + 48;   // detail column (idle cash / basis)
+  const int PF_VAL  = PF_R - 100;  // right edge of the value column
+  const int PF_DAY  = PF_R - 50;   // right edge of the DAY % column
+  const int PF_TOP  = y - 5;       // first text row, inside the panel fill
+  const int PF_ROW  = 12;          // breakdown row pitch
+
+  const float val_r = 0.74f, val_g = 0.80f, val_b = 0.88f;     // money: neutral bright
+  const float hero_r = 0.45f, hero_g = 0.82f, hero_b = 1.00f;  // headline total
+  const float faint_r = 0.30f, faint_g = 0.34f, faint_b = 0.40f;
+
+  if (!LAY.portfolio_enabled) return;   // card hidden from the dashboard
+
+  for (int yy = y - 6; yy < y + 56; yy++)
+    wput(back, W, H, STRIDE, PF_RULE, yy, 0.10f, 0.12f, 0.16f);
+
   if (pf->have) {
-    // Fixed column positions (right-aligned, ~220px wide)
-    // Each column is fixed width so rows align perfectly
-    const int LABEL_X = RX - 215;   // asset label (50px wide)
-    const int VAL_X   = RX - 165;   // $value (50px wide) 
-    const int DAY_X   = RX - 115;   // day P&L% (40px wide)
-    const int OV_X    = RX - 75;    // overall P&L% / qty (40px wide)
-    const int ROW_H   = 16;         // row height
+    char vbuf[24], dbuf[16], daybuf[16], allbuf[16];
 
-    // Header (scale 1, dim)
-    wtext(back, W, H, STRIDE, LABEL_X, y - 14, "ASSET", 1, dim_r, dim_g, dim_b);
-    wtext(back, W, H, STRIDE, VAL_X,   y - 14, "VALUE", 1, dim_r, dim_g, dim_b);
-    wtext(back, W, H, STRIDE, DAY_X,   y - 14, "DAY",   1, dim_r, dim_g, dim_b);
-    wtext(back, W, H, STRIDE, OV_X,    y - 14, "ALL",   1, dim_r, dim_g, dim_b);
+    // ---- Headline: the two books combined, and the column headers ----
+    wtext(back, W, H, STRIDE, PF_L, PF_TOP + 4, "PORTFOLIO", 1, dim_r, dim_g, dim_b);
+    snprintf(vbuf, sizeof(vbuf), "$%.2f", pf->total);
+    wtext(back, W, H, STRIDE, PF_L + 60, PF_TOP, vbuf, 2, hero_r, hero_g, hero_b);
+    wtext_r(back, W, H, STRIDE, PF_DAY, PF_TOP + 8, "DAY", 1, dim_r, dim_g, dim_b);
+    wtext_r(back, W, H, STRIDE, PF_R,   PF_TOP + 8, "ALL", 1, dim_r, dim_g, dim_b);
 
-    // Separator line - full width
-    for (int xx = LABEL_X - 4; xx < RX; xx++) wput(back, W, H, STRIDE, xx, y - 10, 0.10f, 0.12f, 0.16f);
+    for (int xx = PF_L; xx < PF_R; xx++)
+      wput(back, W, H, STRIDE, xx, PF_TOP + 21, 0.10f, 0.12f, 0.16f);
 
-    // Colors
-    float day_r = pf->day_pnl_pct > 0 ? ok_r : pf->day_pnl_pct < 0 ? bad_r : dim_r;
-    float day_g = pf->day_pnl_pct > 0 ? ok_g : pf->day_pnl_pct < 0 ? bad_g : dim_g;
-    float day_b = pf->day_pnl_pct > 0 ? ok_b : pf->day_pnl_pct < 0 ? bad_b : dim_b;
-    float ovr_r = pf->pnl_pct > 0 ? ok_r : pf->pnl_pct < 0 ? bad_r : dim_r;
-    float ovr_g = pf->pnl_pct > 0 ? ok_g : pf->pnl_pct < 0 ? bad_g : dim_g;
-    float ovr_b = pf->pnl_pct > 0 ? ok_b : pf->pnl_pct < 0 ? bad_b : dim_b;
+    // ---- One row per book, then their sum. Each book carries its OWN day and
+    // all-time P&L, measured against its own $1000 of basis, so the two
+    // strategies can be compared at a glance; TOTAL is the whole portfolio. ----
+    struct { const char *name, *detail_fmt; float detail, value, day, all; int bright; } rows[3] = {
+      { "STOCK",  "CASH $%.0f", pf->stock_cash,  pf->stock_value,  pf->stock_day,   pf->stock_pct,  0 },
+      { "CRYPTO", "CASH $%.0f", pf->crypto_cash, pf->crypto_value, pf->crypto_day,  pf->crypto_pct, 0 },
+      { "TOTAL",  "ON $%.0f",   pf->basis,       pf->total,        pf->day_pnl_pct, pf->pnl_pct,    1 },
+    };
+    int ry = PF_TOP + 27;
+    for (int i = 0; i < 3; i++) {
+      float dr2 = rows[i].day > 0 ? ok_r : rows[i].day < 0 ? bad_r : dim_r;
+      float dg2 = rows[i].day > 0 ? ok_g : rows[i].day < 0 ? bad_g : dim_g;
+      float db2 = rows[i].day > 0 ? ok_b : rows[i].day < 0 ? bad_b : dim_b;
+      float ar = rows[i].all > 0 ? ok_r : rows[i].all < 0 ? bad_r : dim_r;
+      float ag = rows[i].all > 0 ? ok_g : rows[i].all < 0 ? bad_g : dim_g;
+      float ab = rows[i].all > 0 ? ok_b : rows[i].all < 0 ? bad_b : dim_b;
+      float lr = rows[i].bright ? val_r : dim_r;
+      float lg = rows[i].bright ? val_g : dim_g;
+      float lb = rows[i].bright ? val_b : dim_b;
+      float vr = rows[i].bright ? hero_r : val_r;
+      float vg = rows[i].bright ? hero_g : val_g;
+      float vb = rows[i].bright ? hero_b : val_b;
 
-    // ---- Row 1: STOCK ----
-    char daybuf[16], ovrbuf[16], valbuf[16];
-    snprintf(daybuf, sizeof(daybuf), "%+5.1f%%", clampf(pf->day_pnl_pct, -99.9f, 99.9f));
-    snprintf(ovrbuf, sizeof(ovrbuf), "%+5.1f%%", clampf(pf->pnl_pct, -99.9f, 99.9f));
-    snprintf(valbuf, sizeof(valbuf), "$%5d", (int)(pf->stock_value + 0.5f));
+      snprintf(dbuf,   sizeof(dbuf),   rows[i].detail_fmt, rows[i].detail);
+      snprintf(vbuf,   sizeof(vbuf),   "$%.2f", rows[i].value);
+      snprintf(daybuf, sizeof(daybuf), "%+.2f%%", clampf(rows[i].day, -999.0f, 999.0f));
+      snprintf(allbuf, sizeof(allbuf), "%+.2f%%", clampf(rows[i].all, -999.0f, 999.0f));
 
-    wtext(back, W, H, STRIDE, LABEL_X, y, "STOCK", 1, cyan_r, cyan_g, cyan_b);
-    wtext(back, W, H, STRIDE, VAL_X,   y, valbuf,  2, day_r, day_g, day_b);
-    wtext(back, W, H, STRIDE, DAY_X,   y, daybuf,  1, day_r, day_g, day_b);
-    wtext(back, W, H, STRIDE, OV_X,    y, ovrbuf,  1, ovr_r, ovr_g, ovr_b);
-
-    // ---- Row 2: BTC ----
-    if (pf->crypto_symbol[0]) {
-      float cr = pf->crypto_pnl_pct > 0 ? ok_r : pf->crypto_pnl_pct < 0 ? bad_r : dim_r;
-      float cg = pf->crypto_pnl_pct > 0 ? ok_g : pf->crypto_pnl_pct < 0 ? bad_g : dim_g;
-      float cb = pf->crypto_pnl_pct > 0 ? ok_b : pf->crypto_pnl_pct < 0 ? bad_b : dim_b;
-      const char *sym = strncmp(pf->crypto_symbol, "X:", 2) == 0 ? pf->crypto_symbol + 2 : pf->crypto_symbol;
-      char cpct[16], cval[16], cqty[16];
-      snprintf(cpct, sizeof(cpct), "%+5.1f%%", clampf(pf->crypto_pnl_pct, -99.9f, 99.9f));
-      snprintf(cval, sizeof(cval), "$%5d", (int)(pf->crypto_value + 0.5f));
-      snprintf(cqty, sizeof(cqty), "%.5f", pf->crypto_qty);
-
-      wtext(back, W, H, STRIDE, LABEL_X, y + ROW_H, sym, 1, cyan_r, cyan_g, cyan_b);
-      wtext(back, W, H, STRIDE, VAL_X,   y + ROW_H, cval,  2, cr, cg, cb);
-      wtext(back, W, H, STRIDE, DAY_X,   y + ROW_H, cpct,  1, cr, cg, cb);
-      wtext(back, W, H, STRIDE, OV_X,    y + ROW_H, cqty,  1, dim_r, dim_g, dim_b);
+      wtext(back, W, H, STRIDE, PF_L, ry, rows[i].name, 1, lr, lg, lb);
+      wtext(back, W, H, STRIDE, PF_QTY, ry, dbuf, 1, faint_r, faint_g, faint_b);
+      wtext_r(back, W, H, STRIDE, PF_VAL, ry, vbuf,   1, vr, vg, vb);
+      wtext_r(back, W, H, STRIDE, PF_DAY, ry, daybuf, 1, dr2, dg2, db2);
+      wtext_r(back, W, H, STRIDE, PF_R,   ry, allbuf, 1, ar, ag, ab);
+      ry += PF_ROW;
     }
-
-    // ---- Row 3: CASH ----
-    char cbuf[16];
-    snprintf(cbuf, sizeof(cbuf), "$%5d", (int)(pf->cash + 0.5f));
-    wtext(back, W, H, STRIDE, LABEL_X, y + 2 * ROW_H, "CASH", 1, cyan_r, cyan_g, cyan_b);
-    wtext(back, W, H, STRIDE, VAL_X,   y + 2 * ROW_H, cbuf,  2, dim_r, dim_g, dim_b);
-    // day/overall blank
   } else {
-    wtext(back, W, H, STRIDE, RX - 54, y, "PORTFOLIO", 1, dim_r, dim_g, dim_b);
-    wtext(back, W, H, STRIDE, RX - 42, y + 16, "NO DATA", 1, dim_r, dim_g, dim_b);
+    wtext(back, W, H, STRIDE, PF_L, PF_TOP + 4, "PORTFOLIO", 1, dim_r, dim_g, dim_b);
+    wtext(back, W, H, STRIDE, PF_L + 60, PF_TOP, "NO DATA", 2, dim_r, dim_g, dim_b);
   }
 }
 

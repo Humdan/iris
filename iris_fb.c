@@ -57,6 +57,42 @@ static void led_set(const char *script) {
     }
 }
 
+// --- NIGHT pill, shared with the web dashboard -----------------------------
+// /tmp/iris_ns_manual holds the manual-night-shift flag. The panel publishes
+// its own taps here and adopts changes made anywhere else (the dashboard's
+// POST /api/lcd/night) at the 1Hz stats cadence, so the pill means the same
+// thing on both screens and survives a restart.
+#define NS_MANUAL_FILE "/tmp/iris_ns_manual"
+static time_t ns_manual_mtime = 0;
+
+static void ns_manual_write(int on) {
+    FILE *f = fopen(NS_MANUAL_FILE, "w");
+    if (f) { fprintf(f, "%d\n", on ? 1 : 0); fclose(f); }
+    struct stat st;
+    if (stat(NS_MANUAL_FILE, &st) == 0) ns_manual_mtime = st.st_mtime;
+}
+
+// Returns the flag's value if the file changed since we last saw it, else cur.
+static int ns_manual_poll(int cur) {
+    struct stat st;
+    if (stat(NS_MANUAL_FILE, &st) != 0) return cur;
+    if (st.st_mtime == ns_manual_mtime) return cur;
+    ns_manual_mtime = st.st_mtime;
+    FILE *f = fopen(NS_MANUAL_FILE, "r");
+    if (!f) return cur;
+    char b[8] = {0};
+    char *got = fgets(b, sizeof(b), f);
+    fclose(f);
+    return got ? (b[0] == '1') : cur;
+}
+
+// Edge-triggered LED: red while manual night mode is on, green when it goes
+// off (unless the real job is still running).
+static void ns_manual_led(int on, int running) {
+    if (on) led_set("/home/humdan/.hermes/scripts/led-red.sh");
+    else if (!running) led_set("/home/humdan/.hermes/scripts/led-green-bright.sh");
+}
+
 // Manual night-shift toggle: the visible NIGHT pill drawn by draw_agent_panel()
 // (NS_PILL_* in iris_widgets.h), padded ~10px so a fingertip reliably lands.
 #define NS_TOGGLE_X (NS_PILL_X - 10)
@@ -281,6 +317,14 @@ int main(int argc, char **argv) {
     double t0 = now(), tlast = t0, tcheck = 0, tfps = t0, tnext = t0, tstats = 0;
     int frames = 0;
     float global_time = 0;
+    // Layout: dashboard-owned positions/visibility. Loaded before the first
+    // frame and re-polled at the 1Hz stats cadence, so a change made in the web
+    // UI shows up on the panel within a second without restarting anything.
+    char layout_path[512];
+    snprintf(layout_path, sizeof(layout_path), "%s%s",
+             getenv("HOME") ? getenv("HOME") : "/home/humdan", LAYOUT_PATH_REL);
+    layout_load(&LAY, layout_path, W, H);
+
     FeedStats stats; read_stats(&stats);   // clock + tool-call feed, refreshed ~1 Hz below
     AgentStats agent; read_agent_stats(&agent);
     PortfolioStats portfolio; read_portfolio_stats(&portfolio);
@@ -312,7 +356,7 @@ int main(int argc, char **argv) {
         #define NS_START_WINDOW 180.0
         double ns_tick_at   = 0;     // wall-clock epoch of Hermes's last cron tick
         int    ns_running   = 0;     // night shift actively running (fresh transcript mtime)
-        int    ns_manual    = 0;     // manual night shift mode toggle (0=off, 1=on)
+        int    ns_manual    = ns_manual_poll(0);   // manual night shift mode (shared with the dashboard)
         int    ns_manual_prev = 0;   // previous manual state for edge-triggered LED
 
     // Session orbs state
@@ -359,7 +403,7 @@ int main(int argc, char **argv) {
             double dts = t - prev_sample_t; if (dts <= 0) dts = 1.0/60.0;
             int dx = tx - prev_x, dy = ty - prev_y;
             int total_dx = tx - gesture_down_x, total_dy = ty - gesture_down_y;
-            int started_in_panel = (gesture_down_x < QUEUE_PANEL_W);
+            int started_in_panel = LAY.queue_enabled && (gesture_down_x < QUEUE_PANEL_W);
 
             // decide gesture kind once movement exceeds a small threshold
             if (!gesture_decided && (abs(total_dx) > 8 || abs(total_dy) > 8)) {
@@ -404,7 +448,7 @@ int main(int argc, char **argv) {
                     (sel_job >= 0 && strcmp(stats.names[sel_job], NS_JOB_NAME) == 0);
                 // Top-right NIGHT SHIFT button (padded tap zone). Fires only when
                 // no run is live and it wasn't just tapped (no double starts).
-                if (upx >= NS_RUN_X - 8 && upy < NS_RUN_Y + NS_RUN_H + 10) {
+                if (LAY.nightbtn_enabled && upx >= NS_RUN_X - 8 && upy < NS_RUN_Y + NS_RUN_H + 10) {
                     if (!ns_running && t - ns_fire_at > NS_START_WINDOW) {
                         ns_fire_job();      // fork+exec detached; returns instantly
                         ns_fire_at = t;
@@ -421,20 +465,15 @@ int main(int argc, char **argv) {
                 }
                 // MANUAL NIGHT SHIFT TOGGLE: reachable on the normal screen (not
                 // gated behind an open overlay). Small pill in the bottom agent panel.
-                if (!handled && upx >= NS_TOGGLE_X && upx < NS_TOGGLE_X + NS_TOGGLE_W &&
+                if (!handled && LAY.panel_enabled && upx >= NS_TOGGLE_X && upx < NS_TOGGLE_X + NS_TOGGLE_W &&
                     upy >= NS_TOGGLE_Y && upy < NS_TOGGLE_Y + NS_TOGGLE_H) {
                     ns_manual = !ns_manual;
-                    // Edge-triggered LED: red when mode goes ON, green when it goes
-                    // OFF (only if the real job isn't also running).
-                    if (ns_manual) {
-                        led_set("/home/humdan/.hermes/scripts/led-red.sh");
-                    } else if (!ns_running) {
-                        led_set("/home/humdan/.hermes/scripts/led-green-bright.sh");
-                    }
+                    ns_manual_write(ns_manual);   // tell the dashboard
+                    ns_manual_led(ns_manual, ns_running);
                     ns_manual_prev = ns_manual;
                     handled = 1;
                 }
-                if (!handled && upx < QUEUE_PANEL_W && upy >= QUEUE_LY - 6) {
+                if (!handled && LAY.queue_enabled && upx < QUEUE_PANEL_W && upy >= QUEUE_LY - 6) {
                     int row = (upy - QUEUE_LY) / QUEUE_ROW_H;
                     int idx = scroll_target + row;
                     if (row >= 0 && row < QUEUE_VISIBLE && idx >= 0 && idx < stats.njobs) {
@@ -524,6 +563,11 @@ int main(int argc, char **argv) {
         // --- widgets: clock + system stats + agent panel on top of the orb ---
         if (t - tstats > 1.0) {
             tstats = t; read_stats(&stats); read_agent_stats(&agent); read_portfolio_stats(&portfolio);
+            layout_poll(&LAY, layout_path, W, H);
+            {   // NIGHT pill toggled from the dashboard?
+                int nm = ns_manual_poll(ns_manual);
+                if (nm != ns_manual) { ns_manual = nm; ns_manual_led(ns_manual, ns_running); }
+            }
             // Running = a live Night-shift lane from the Hermes plugin (exact),
             // or the step-log heuristics (fallback while the plugin isn't loaded).
             read_ns_view(&ns_view);
@@ -568,7 +612,8 @@ int main(int argc, char **argv) {
         // --- Session orbs: draw around the main sphere (BACKGROUND layer) ---
         read_session_stats(&sessions, t);
         update_session_orbs(&sessions, dt);
-        draw_session_orbs(back, W, H, STRIDE, &sessions, global_time, act);
+        if (LAY.orbs_enabled)
+            draw_session_orbs(back, W, H, STRIDE, &sessions, global_time, act);
 
         // Night shift no longer tints the whole screen or draws a top banner
         // (that hid the clock and turned Iris red); the log panel in the left
@@ -580,12 +625,14 @@ int main(int argc, char **argv) {
         draw_widgets(back, W, H, STRIDE, &stats, (int)(scroll_f + 0.5f), sel_job, !show_log);
 
         // --- Agent panel (TOP layer - clean, no tint) ---
-        draw_agent_panel(back, W, H, STRIDE, &agent, ns_manual, &portfolio);
+        if (LAY.panel_enabled)
+            draw_agent_panel(back, W, H, STRIDE, &agent, ns_manual, &portfolio);
 
         // --- NIGHT SHIFT trigger, top-right corner (always shown) ---
         // STARTING shows from the tap until the run is detected (up to 60s).
-        draw_ns_run_button(back, W, H, STRIDE, ns_running,
-                           ns_starting, ns_pulse);
+        if (LAY.nightbtn_enabled)
+            draw_ns_run_button(back, W, H, STRIDE, ns_running,
+                               ns_starting, ns_pulse);
 
         // --- Night shift log (left column) or job detail overlay ---
         if (show_log) {

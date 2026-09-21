@@ -78,6 +78,30 @@ The Python `--framebuffer` mode is kept as a fallback but is blocky and slow.
 
 The service takes over tty1, starts idle, and restarts on failure.
 
+## Layout is owned by the dashboard (http://<pi>:8080)
+
+Where the LCD widgets sit, and which ones are drawn at all, is **not** hardcoded any more.
+`iris_fb` reads `~/.config/iris/layout.conf` (one `key=value` per line) and re-reads it at the
+1 Hz stats cadence, so a change made in the dashboard's **LCD — Iris screen** card lands on the
+real panel within a second — no restart, no rebuild. Touch zones are derived from the same
+values, so a widget that moves takes its tap target with it, and a widget that is switched off
+stops responding to taps.
+
+| key | what it moves |
+|---|---|
+| `clock.enabled` / `.x` / `.y` | big clock + date (x is the CENTER) |
+| `queue.enabled` / `.x` / `.y` / `.rows` | left cron-queue column, rows visible |
+| `panel.enabled` / `.y` | bottom agent panel (the night pill rides with it) |
+| `portfolio.enabled` / `.x` | portfolio card inside the panel (left edge) |
+| `orbs.enabled` | per-session orbs around the sphere |
+| `nightbtn.enabled` | top-right RUN NIGHT SHIFT button |
+
+Delete the file to fall back to the built-in defaults, which are exactly the old hardcoded
+layout. Values are clamped both in `server.py` and in `layout_clamp()` so nothing can be pushed
+off-screen. Adding a field means: `LAYOUT_FIELDS` in `iris_layout.h`, a default in
+`layout_defaults()`, and the matching entry in `server.py`'s `LCD_SCHEMA` — the dashboard UI is
+generated from that schema, so no JS change is needed.
+
 ## Driving it from Hermes Agent (live "processor" mode)
 
 `plugin/` is a Hermes plugin that turns real agent activity into a decaying
