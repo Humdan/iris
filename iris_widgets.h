@@ -218,10 +218,13 @@ static long when_secs(const char *iso) {
 static void when_label(const char *iso, char *out, int outsz) {
   long d = when_secs(iso);
   if (d == WHEN_NEVER) { snprintf(out, outsz, "-"); return; }
-  if (d < 0) { snprintf(out, outsz, "DUE"); return; }
-  if (d < 3600) snprintf(out, outsz, "IN %ldM", d/60);
-  else if (d < 86400) snprintf(out, outsz, "IN %ldH", d/3600);
-  else snprintf(out, outsz, "IN %ldD", d/86400);
+  // Inside a minute it is firing now; "IN 0M" reads like "not scheduled".
+  if (d < 45) { snprintf(out, outsz, "DUE"); return; }
+  // Round to nearest, not down: a job 7h48m away is "IN 8H", not "IN 7H".
+  // Truncating quietly promised things were sooner than they were.
+  if (d < 3600) snprintf(out, outsz, "IN %ldM", (d + 30) / 60);
+  else if (d < 86400) snprintf(out, outsz, "IN %ldH", (d + 1800) / 3600);
+  else snprintf(out, outsz, "IN %ldD", (d + 43200) / 86400);
 }
 
 // A recurring job split across time slots ("Hyper Portfolio 08:30", "... 10:00")
@@ -264,8 +267,11 @@ static int ns_is_nightshift(const char *name) {
 static int should_hide_job(const char *name) {
     if (!name) return 0;
     if (strcmp(name, "Night shift") == 0) return 1;
+    if (strstr(name, "LED") != NULL) return 1;  // LED control jobs
+    // Cache refreshers exist to feed this very panel. Listing them as queued
+    // work makes the queue look busier than the machine actually is.
+    if (strstr(name, "LCD cache") != NULL) return 1;
     if (strstr(name, "Portfolio LCD") != NULL) return 1;
-    if (strstr(name, "LED") != NULL) return 1;  // also hide LED control jobs
     return 0;
 }
 
@@ -1203,7 +1209,12 @@ static void read_agent_stats(AgentStats *a) {
   }
 
   // Check dashboard and iris systemd services (refreshed ~1Hz)
-  FILE *fp = popen("systemctl --user is-active dashboard 2>/dev/null", "r");
+  // iris_fb runs as the SYSTEM iris.service, which has no session bus, so a bare
+  // `systemctl --user` there fails with "$DBUS_SESSION_BUS_ADDRESS and
+  // $XDG_RUNTIME_DIR not defined" and every user unit reads as down -- which is
+  // why DASH sat red while the dashboard was running. Point it at the user's
+  // runtime dir explicitly.
+  FILE *fp = popen("XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active dashboard 2>/dev/null", "r");
   if (fp) {
     char buf[32] = {0};
     if (fgets(buf, sizeof(buf) - 1, fp)) {
@@ -1211,7 +1222,11 @@ static void read_agent_stats(AgentStats *a) {
     }
     pclose(fp);
   }
-  fp = popen("systemctl --user is-active iris 2>/dev/null", "r");
+  // The renderer is owned by the SYSTEM iris.service; the user unit is disabled
+  // on purpose (two renderers flicker). Asking `systemctl --user` therefore
+  // always answered "inactive" and the panel drew its own IRIS dot red while it
+  // was the thing drawing it. Ask the system unit instead.
+  fp = popen("systemctl is-active iris 2>/dev/null", "r");
   if (fp) {
     char buf[32] = {0};
     if (fgets(buf, sizeof(buf) - 1, fp)) {
@@ -1219,6 +1234,184 @@ static void read_agent_stats(AgentStats *a) {
     }
     pclose(fp);
   }
+}
+
+// ---- Night-shift work queue -------------------------------------------------
+// What the overnight agent has lined up: planned requests (REQUESTS.md), the
+// discovery leads it sweeps, and tonight's cards with their state. Written by
+// ~/.hermes/scripts/ns-queue-cache.py as "KIND|STATE|TITLE|DETAIL" lines so the
+// render loop never has to touch sqlite or parse markdown.
+#define NSQ_FILE "/tmp/iris_ns_queue"
+#define NSQ_MAX  40
+
+typedef struct {
+  char kind[6];        // REQ / LEAD / CARD
+  int  state;          // 0 waiting, 1 running, 2 done, 3 failed
+  char title[66];
+  char detail[264];
+} NsQueueItem;
+
+typedef struct {
+  NsQueueItem items[NSQ_MAX];
+  int n;
+  int waiting, running, done;
+} NsQueue;
+
+static void read_ns_queue(NsQueue *q) {
+  memset(q, 0, sizeof(*q));
+  FILE *f = fopen(NSQ_FILE, "r");
+  if (!f) return;
+  char line[260];
+  while (q->n < NSQ_MAX && fgets(line, sizeof(line), f)) {
+    char *nl = strchr(line, '\n'); if (nl) *nl = 0;
+    if (!line[0]) continue;
+    char *p1 = strchr(line, '|');   if (!p1) continue; *p1++ = 0;
+    char *p2 = strchr(p1, '|');     if (!p2) continue; *p2++ = 0;
+    char *p3 = strchr(p2, '|');     if (p3) *p3++ = 0;
+    NsQueueItem *it = &q->items[q->n];
+    snprintf(it->kind, sizeof(it->kind), "%s", line);
+    it->state = atoi(p1);
+    snprintf(it->title, sizeof(it->title), "%s", p2);
+    snprintf(it->detail, sizeof(it->detail), "%s", p3 ? p3 : "");
+    if (it->state == 1) q->running++;
+    else if (it->state == 2) q->done++;
+    else q->waiting++;
+    q->n++;
+  }
+  fclose(f);
+}
+
+// Row colour by state, matching the cron queue's language: green = fine/queued,
+// cyan = working now, dim = finished, red = failed.
+static void nsq_colour(int state, float *r, float *g, float *b) {
+  if (state == 1)      { *r = 0.35f; *g = 0.75f; *b = 0.95f; }
+  else if (state == 2) { *r = 0.30f; *g = 0.34f; *b = 0.40f; }
+  else if (state == 3) { *r = 0.95f; *g = 0.30f; *b = 0.30f; }
+  else                 { *r = 0.25f; *g = 0.85f; *b = 0.45f; }
+}
+
+// Same geometry as the cron queue so the two views feel like one column with
+// two pages: header, then LAY.queue_rows rows of QUEUE_ROW_H.
+static void draw_ns_queue(uint16_t *back, int W, int H, int STRIDE,
+                          const NsQueue *q, int scroll, int sel) {
+  const float dim_r = 0.40f, dim_g = 0.45f, dim_b = 0.52f;
+  int lx = QUEUE_LX, ly = QUEUE_LY;
+
+  char hdr[40];
+  snprintf(hdr, sizeof(hdr), "NIGHT %d", q->n);
+  wtext(back, W, H, STRIDE, lx, ly - 28, hdr, 2, 0.60f, 0.45f, 0.75f);
+  if (q->n) {
+    char sub[40];
+    snprintf(sub, sizeof(sub), "%d RUN %d WAIT %d DONE", q->running, q->waiting, q->done);
+    // Sit after the header rather than at a fixed offset: "NIGHT 12" is wider
+    // than "NIGHT 4" and the two were overlapping at two digits.
+    wtext(back, W, H, STRIDE, lx + (int)strlen(hdr) * 12 + 10, ly - 22, sub, 1, dim_r, dim_g, dim_b);
+  }
+
+  if (q->n == 0) {
+    wtext(back, W, H, STRIDE, lx, ly, "NOTHING QUEUED", 2, dim_r, dim_g, dim_b);
+    return;
+  }
+  if (scroll < 0) scroll = 0;
+  if (scroll > q->n - 1) scroll = q->n - 1;
+
+  int shown = 0;
+  for (int i = scroll; i < q->n && shown < QUEUE_VISIBLE; i++, shown++) {
+    const NsQueueItem *it = &q->items[i];
+    int yy = ly + shown * QUEUE_ROW_H;
+    if (i == sel) {
+      for (int by = -6; by < QUEUE_ROW_H - 8; by++)
+        for (int bx = -4; bx < QUEUE_PANEL_W - QUEUE_LX; bx++)
+          wput(back, W, H, STRIDE, lx + bx, yy + by, 0.12f, 0.10f, 0.18f);
+    }
+    float r, g, b; nsq_colour(it->state, &r, &g, &b);
+    for (int a = 0; a < 8; a++) for (int c = 0; c < 8; c++)
+      if ((a-4)*(a-4)+(c-4)*(c-4) <= 16) wput(back, W, H, STRIDE, lx+a, yy+2+c, r, g, b);
+
+    // Title, truncated to the column; the detail overlay has the whole thing.
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%.20s", it->title);
+    wtext(back, W, H, STRIDE, lx + 14, yy, buf, 2, r, g, b);
+    // Kind badge + the first of the detail, so a glance says what kind of work.
+    char sub[44];
+    snprintf(sub, sizeof(sub), "%-4s %.32s", it->kind, it->detail[0] ? it->detail : "-");
+    wtext(back, W, H, STRIDE, lx + 14, yy + 18, sub, 1, dim_r, dim_g, dim_b);
+  }
+
+  // Scroll affordances, same as the cron queue's.
+  if (scroll > 0) wtext(back, W, H, STRIDE, QUEUE_PANEL_W - 20, ly - 12, "-", 2, dim_r, dim_g, dim_b);
+  if (scroll + QUEUE_VISIBLE < q->n)
+    wtext(back, W, H, STRIDE, QUEUE_PANEL_W - 20, ly + (QUEUE_VISIBLE - 1) * QUEUE_ROW_H + 20, "_", 2, dim_r, dim_g, dim_b);
+}
+
+// Expanded view of one queued item: the full title and detail, wrapped.
+static void draw_ns_queue_detail(uint16_t *back, int W, int H, int STRIDE,
+                                 const NsQueue *q, int sel) {
+  if (sel < 0 || sel >= q->n) return;
+  const NsQueueItem *it = &q->items[sel];
+  const float dim_r = 0.55f, dim_g = 0.60f, dim_b = 0.68f;
+  const float lbl_r = 0.40f, lbl_g = 0.45f, lbl_b = 0.52f;
+  float r, g, b; nsq_colour(it->state, &r, &g, &b);
+
+  wfill(back, W, H, STRIDE, OVL_X, OVL_Y, OVL_W, OVL_H, 0.04f, 0.05f, 0.10f);
+  for (int x = 0; x < OVL_W; x++) {
+    if (x < 6 || x > OVL_W - 7) continue;
+    wput(back, W, H, STRIDE, OVL_X + x, OVL_Y, r, g, b);
+    wput(back, W, H, STRIDE, OVL_X + x, OVL_Y + OVL_H - 1, r, g, b);
+  }
+  for (int y = 0; y < OVL_H; y++) {
+    if (y < 6 || y > OVL_H - 7) continue;
+    wput(back, W, H, STRIDE, OVL_X, OVL_Y + y, r, g, b);
+    wput(back, W, H, STRIDE, OVL_X + OVL_W - 1, OVL_Y + y, r, g, b);
+  }
+
+  int px = OVL_X + 18, py = OVL_Y + 14;
+  const char *state_txt = it->state == 1 ? "RUNNING" : it->state == 2 ? "DONE"
+                        : it->state == 3 ? "FAILED"  : "QUEUED";
+  wtext(back, W, H, STRIDE, px, py, it->kind, 1, lbl_r, lbl_g, lbl_b);
+  wtext(back, W, H, STRIDE, px + 40, py, state_txt, 1, r, g, b);
+
+  // Title over two lines if it needs them (26 chars fit at scale 2).
+  py += 16;
+  {
+    const char *t = it->title;
+    for (int ln = 0; *t && ln < 2; ln++) {
+      int take = (int)strlen(t);
+      if (take > 26) {                 // 26 chars fit at scale 2
+        take = 26;
+        int brk = take;
+        while (brk > 10 && t[brk] != ' ') brk--;   // break on a word, not mid-syllable
+        if (brk > 10) take = brk;
+      }
+      char line[32];
+      snprintf(line, sizeof(line), "%.*s", take, t);
+      wtext(back, W, H, STRIDE, px, py, line, 2, r, g, b);
+      t += take;
+      while (*t == ' ') t++;
+      if (*t) py += 20;
+    }
+  }
+
+  // Detail, word-wrapped at the panel width (scale 1 -> 72 chars).
+  py += 28;
+  const int WRAP = 72;
+  const char *d = it->detail;
+  while (*d && py < OVL_Y + OVL_H - 14) {
+    int take = (int)strlen(d);
+    if (take > WRAP) {
+      take = WRAP;
+      int brk = take;
+      while (brk > 20 && d[brk] != ' ') brk--;
+      if (brk > 20) take = brk;
+    }
+    char wbuf[80];
+    snprintf(wbuf, sizeof(wbuf), "%.*s", take, d);
+    wtext(back, W, H, STRIDE, px, py, wbuf, 1, dim_r, dim_g, dim_b);
+    d += take;
+    while (*d == ' ') d++;
+    py += 12;
+  }
+  wtext(back, W, H, STRIDE, OVL_X + OVL_W - 80, OVL_Y + OVL_H - 16, "TAP TO CLOSE", 1, lbl_r, lbl_g, lbl_b);
 }
 
 // ---- Paper-portfolio snapshot, refreshed via a tiny cache file the C loop

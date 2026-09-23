@@ -63,6 +63,31 @@ static void led_set(const char *script) {
 // POST /api/lcd/night) at the 1Hz stats cadence, so the pill means the same
 // thing on both screens and survives a restart.
 #define NS_MANUAL_FILE "/tmp/iris_ns_manual"
+#define LEFT_VIEW_FILE "/tmp/iris_left_view"
+
+static time_t left_view_mtime = 0;
+
+static void left_view_write(int v) {
+    FILE *f = fopen(LEFT_VIEW_FILE, "w");
+    if (f) { fprintf(f, "%d\n", v ? 1 : 0); fclose(f); }
+    struct stat st;
+    if (stat(LEFT_VIEW_FILE, &st) == 0) left_view_mtime = st.st_mtime;
+}
+
+// Adopt a change made anywhere else (the dashboard, a script) the same way the
+// NIGHT pill does, so the column can be switched without reaching for the glass.
+static int left_view_poll(int cur) {
+    struct stat st;
+    if (stat(LEFT_VIEW_FILE, &st) != 0) return cur;
+    if (st.st_mtime == left_view_mtime) return cur;
+    left_view_mtime = st.st_mtime;
+    FILE *f = fopen(LEFT_VIEW_FILE, "r");
+    if (!f) return cur;
+    char b[8] = {0};
+    char *got = fgets(b, sizeof(b), f);
+    fclose(f);
+    return got ? (b[0] == '1') : cur;
+}
 static time_t ns_manual_mtime = 0;
 
 static void ns_manual_write(int on) {
@@ -91,6 +116,40 @@ static int ns_manual_poll(int cur) {
 static void ns_manual_led(int on, int running) {
     if (on) led_set("/home/humdan/.hermes/scripts/led-red.sh");
     else if (!running) led_set("/home/humdan/.hermes/scripts/led-green-bright.sh");
+}
+
+// Manual night mode is a LATCH: only another toggle clears it, and since it
+// became a file (so the dashboard could flip it too) it now also survives a
+// restart -- before that, restarting the renderer cleared it. A toggle made
+// during the night would otherwise hold the panel in night view, and the LED
+// red, all the next day. That is exactly what happened on 2026-09-22: the flag
+// went on at 02:09 and was still on at 11:30. So expire a toggle that was made
+// before the shift window closed, once the window has closed and nothing is
+// running. A toggle made DURING the day keeps its mtime after the window end,
+// so a deliberate daytime switch still stays on.
+#define NS_WINDOW_END_HOUR 7      // shift runs 01:00-06:45; 07:00 is the far side
+
+static time_t ns_window_end_today(void) {
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    tm.tm_hour = NS_WINDOW_END_HOUR; tm.tm_min = 0; tm.tm_sec = 0;
+    return mktime(&tm);
+}
+
+// Returns 1 if it cleared a stale latch.
+static int ns_manual_expire(int ns_manual, int ns_running) {
+    if (!ns_manual || ns_running) return 0;
+    time_t end = ns_window_end_today();
+    struct stat st;
+    if (time(NULL) <= end) return 0;             // window has not closed yet today
+    if (stat(NS_MANUAL_FILE, &st) != 0) return 0;
+    if (st.st_mtime >= end) return 0;            // switched on after the window: deliberate
+    ns_manual_write(0);
+    ns_manual_led(0, ns_running);
+    fprintf(stderr, "night: manual mode expired (set before %02d:00, nothing running)\n",
+            NS_WINDOW_END_HOUR);
+    return 1;
 }
 
 // Manual night-shift toggle: the visible NIGHT pill drawn by draw_agent_panel()
@@ -328,6 +387,7 @@ int main(int argc, char **argv) {
     FeedStats stats; read_stats(&stats);   // clock + tool-call feed, refreshed ~1 Hz below
     AgentStats agent; read_agent_stats(&agent);
     PortfolioStats portfolio; read_portfolio_stats(&portfolio);
+    NsQueue ns_queue; read_ns_queue(&ns_queue);
 
     // --- touch: spawn the reader thread; render loop only samples shared state ---
     pthread_t tid;
@@ -342,6 +402,15 @@ int main(int argc, char **argv) {
     float scroll_f     = 0.0f;   // eased scroll position (fractional job index)
     int   scroll_target = 0;     // integer scroll goal, adjusted by vertical swipe
     int   sel_job      = -1;     // selected job for detail overlay, -1 = none
+    // The left column has two pages: the cron queue and the night-shift work
+    // queue. Tapping the column header switches between them; the choice is
+    // remembered in /tmp/iris_left_view so a renderer restart does not lose it.
+    int   left_view    = 0;      // 0 = cron queue, 1 = night-shift queue
+    int   ns_sel       = -1;     // selected night-queue row, -1 = none
+    {
+        FILE *lv = fopen(LEFT_VIEW_FILE, "r");
+        if (lv) { char b[8] = {0}; if (fgets(b, sizeof(b), lv)) left_view = (b[0] == '1'); fclose(lv); }
+    }
 
     // Night shift CONSOLE state: transcript cache refreshed ~1Hz, plus a brief
     // FIRING feedback timestamp set when the RUN NOW button is tapped.
@@ -473,7 +542,26 @@ int main(int argc, char **argv) {
                     ns_manual_prev = ns_manual;
                     handled = 1;
                 }
-                if (!handled && LAY.queue_enabled && upx < QUEUE_PANEL_W && upy >= QUEUE_LY - 6) {
+                // Column header: switch between the cron queue and the night queue.
+                if (!handled && LAY.queue_enabled && upx < QUEUE_PANEL_W &&
+                    upy >= QUEUE_LY - 40 && upy < QUEUE_LY - 6) {
+                    left_view = !left_view;
+                    left_view_write(left_view);
+                    scroll_target = 0;      // each page starts at the top
+                    sel_job = -1; ns_sel = -1;
+                    handled = 1;
+                }
+                // Night-queue rows: tap to expand, tap again to close.
+                if (!handled && LAY.queue_enabled && left_view == 1 &&
+                    upx < QUEUE_PANEL_W && upy >= QUEUE_LY - 6) {
+                    int row = (upy - QUEUE_LY) / QUEUE_ROW_H;
+                    int idx = scroll_target + row;
+                    if (row >= 0 && row < QUEUE_VISIBLE && idx >= 0 && idx < ns_queue.n) {
+                        ns_sel = (ns_sel == idx) ? -1 : idx;
+                        handled = 1;
+                    }
+                }
+                if (!handled && left_view == 0 && LAY.queue_enabled && upx < QUEUE_PANEL_W && upy >= QUEUE_LY - 6) {
                     int row = (upy - QUEUE_LY) / QUEUE_ROW_H;
                     int idx = scroll_target + row;
                     if (row >= 0 && row < QUEUE_VISIBLE && idx >= 0 && idx < stats.njobs) {
@@ -483,14 +571,15 @@ int main(int argc, char **argv) {
                         handled = 1;
                     }
                 }
-                if (!handled) sel_job = -1;   // tap elsewhere dismisses overlay
+                if (!handled) { sel_job = -1; ns_sel = -1; }   // tap elsewhere dismisses overlays
             }
             // horizontal fling already left momentum in touch_vel; nothing more to do
         }
 
         // clamp scroll target to valid range and ease scroll_f toward it
         {
-            int maxs = stats.njobs - QUEUE_VISIBLE; if (maxs < 0) maxs = 0;
+            int items = (left_view == 1) ? ns_queue.n : stats.njobs;
+            int maxs = items - QUEUE_VISIBLE; if (maxs < 0) maxs = 0;
             if (scroll_target < 0) scroll_target = 0;
             if (scroll_target > maxs) scroll_target = maxs;
             scroll_f += ((float)scroll_target - scroll_f) * (1.0f - expf(-12.0f * dt));
@@ -564,9 +653,16 @@ int main(int argc, char **argv) {
         if (t - tstats > 1.0) {
             tstats = t; read_stats(&stats); read_agent_stats(&agent); read_portfolio_stats(&portfolio);
             layout_poll(&LAY, layout_path, W, H);
+            read_ns_queue(&ns_queue);
+            if (ns_sel >= ns_queue.n) ns_sel = -1;   // row vanished from the queue
+            {
+                int lv = left_view_poll(left_view);
+                if (lv != left_view) { left_view = lv; scroll_target = 0; sel_job = -1; ns_sel = -1; }
+            }
             {   // NIGHT pill toggled from the dashboard?
                 int nm = ns_manual_poll(ns_manual);
                 if (nm != ns_manual) { ns_manual = nm; ns_manual_led(ns_manual, ns_running); }
+                if (ns_manual_expire(ns_manual, ns_running)) ns_manual = 0;
             }
             // Running = a live Night-shift lane from the Hermes plugin (exact),
             // or the step-log heuristics (fallback while the plugin isn't loaded).
@@ -622,7 +718,13 @@ int main(int argc, char **argv) {
         int show_log = ns_open;
 
         // --- Widgets: clock, plus the cron queue unless the night log owns the column ---
-        draw_widgets(back, W, H, STRIDE, &stats, (int)(scroll_f + 0.5f), sel_job, !show_log);
+        // The clock always draws; the left column shows the night console, the
+        // night-shift queue, or the cron queue - one of the three.
+        draw_widgets(back, W, H, STRIDE, &stats, (int)(scroll_f + 0.5f), sel_job,
+                     !show_log && left_view == 0);
+        // left_view is a deliberate choice, so it outranks the automatic console.
+        if (left_view == 1 && LAY.queue_enabled)
+            draw_ns_queue(back, W, H, STRIDE, &ns_queue, (int)(scroll_f + 0.5f), ns_sel);
 
         // --- Agent panel (TOP layer - clean, no tint) ---
         if (LAY.panel_enabled)
@@ -635,7 +737,7 @@ int main(int argc, char **argv) {
                                ns_starting, ns_pulse);
 
         // --- Night shift log (left column) or job detail overlay ---
-        if (show_log) {
+        if (show_log && left_view == 0) {
             int firing = (t - ns_fire_at) < 2.5;   // brief RUN NOW feedback
             // Task view when lanes are known; raw step log as the fallback
             // (manual mode with nothing running, or plugin not yet reloaded).
@@ -646,6 +748,8 @@ int main(int argc, char **argv) {
                 draw_night_tasks(back, W, H, STRIDE, &ns_view, ns_manual, ns_pulse);
             else
                 draw_night_log(back, W, H, STRIDE, &ns_con, firing, ns_manual, ns_pulse);
+        } else if (left_view == 1 && ns_sel >= 0) {
+            draw_ns_queue_detail(back, W, H, STRIDE, &ns_queue, ns_sel);
         } else if (sel_job >= 0) {
             draw_job_detail(back, W, H, STRIDE, &stats, sel_job);
         }
