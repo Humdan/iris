@@ -471,10 +471,12 @@ static void wfill(uint16_t *back, int W, int H, int STRIDE, int x, int y, int w,
 // Night-shift log panel: takes over the LEFT column (where the queue normally
 // is) while night shift is on, so the clock, Iris and the bottom panel stay
 // visible. Right edge stops short of the orb (its left edge is >= x=380).
-#define NSC_X 0
-#define NSC_Y 70
-#define NSC_W 374
-#define NSC_H 336          // down to y=406, just above the bottom panel
+// Uses the dashboard-owned queue position/width so moving the queue from the
+// web UI moves the night console with it.
+#define NSC_X      ((int)LAY.queue_x)
+#define NSC_Y      ((int)LAY.queue_y)
+#define NSC_W      248                       // matches queue panel width (QUEUE_PANEL_W - LAY.queue_x)
+#define NSC_H      ((int)LAY.panel_y - NSC_Y - 4)  // down to just above the bottom panel
 // Manual night-shift trigger: top-right corner of the screen (clear of the
 // centered clock, which ends at x~496, and above the orb).
 #define NS_RUN_W 124
