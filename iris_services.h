@@ -5,10 +5,14 @@
 // which rewrites SVC_FILE every beat; this side only reads it at the 1 Hz
 // stats cadence, so the render loop never blocks on a network probe.
 //
+// Services come in two groups: DYNAMIC (they do work -- serve other things,
+// run jobs, can be triggered) and STATIC (only answer when asked). The network
+// itself is the NET dot in the header, not a list entry.
+//
 // COMPACT (default): header with an up/total count, then the active services
-// as a two-column grid. EXPANDED: one row per service with its round trip,
-// active first, then the ones that failed in red with the reason. When the
-// cron queue is expanded instead, this folds to its header line.
+// of each group as a two-column grid. EXPANDED: one row per service with its
+// round trip, grouped, active first then failures in red with the reason.
+// When the cron queue is expanded instead, this folds to its header line.
 #ifndef IRIS_SERVICES_H
 #define IRIS_SERVICES_H
 
@@ -22,18 +26,20 @@ typedef struct {
   char name[12];
   int  ok;
   int  ms;
+  char kind;        // 'D' dynamic, 'S' static, 'N' network
   char detail[41];
 } SvcItem;
 
 typedef struct {
   SvcItem s[SVC_MAX];
-  int n, nup;
+  int n, nup;       // list entries (D + S) and how many passed
+  int net;          // -1 unknown, else the INTERNET probe
   int stale;        // no file, or no beat for 3 intervals: trust nothing in it
 } SvcStats;
 
 static void read_services(SvcStats *sv) {
   memset(sv, 0, sizeof(*sv));
-  sv->stale = 1;
+  sv->stale = 1; sv->net = -1;
   FILE *f = fopen(SVC_FILE, "r");
   if (!f) return;
   char line[160];
@@ -43,12 +49,13 @@ static void read_services(SvcStats *sv) {
     if (sv->n >= SVC_MAX) continue;
     SvcItem *it = &sv->s[sv->n];
     char name[32] = {0}, detail[64] = {0};
-    int ok = 0, ms = 0;
-    if (sscanf(line, "%31[^|]|%d|%d|%63[^\n]", name, &ok, &ms, detail) < 3) continue;
+    int ok = 0, ms = 0; char kind = 'D';
+    if (sscanf(line, "%31[^|]|%d|%d|%c|%63[^\n]", name, &ok, &ms, &kind, detail) < 4) continue;
+    if (kind == 'N') { sv->net = ok; continue; }
     snprintf(it->name, sizeof(it->name), "%s", name);
     snprintf(it->detail, sizeof(it->detail), "%s", detail);
     for (char *p = it->detail; *p; p++) *p = (char)toupper((unsigned char)*p);  // font is A-Z only
-    it->ok = ok; it->ms = ms;
+    it->ok = ok; it->ms = ms; it->kind = kind == 'S' ? 'S' : 'D';
     if (ok) sv->nup++;
     sv->n++;
   }
@@ -84,57 +91,85 @@ static void draw_services(uint16_t *back, int W, int H, int STRIDE, const SvcSta
     wtext(back, W, H, STRIDE, x + 10, hy + 4, buf, 1,
           all ? ok_r : amb_r, all ? ok_g : amb_g, all ? ok_b : amb_b);
   }
+  // NET: the Pi's own internet link, left of the expand box
+  if (sv->net >= 0 && !sv->stale) {
+    int nx = EXP_BOX_X - 44;
+    wtext(back, W, H, STRIDE, nx, hy + 4, "NET", 1, dim_r, dim_g, dim_b);
+    svc_dot(back, W, H, STRIDE, nx + 22, hy + 4, 7,
+            sv->net ? ok_r : bad_r, sv->net ? ok_g : bad_g, sv->net ? ok_b : bad_b);
+  }
   draw_expand_box(back, W, H, STRIDE, hy - 2, expanded);
   if (EXP.queue && !expanded) return;          // folded under an expanded queue
   if (sv->stale) return;                       // a dead heartbeat proves nothing is up
 
-  int y = hy + SVC_HDR_H + 2;
+  static const char KINDS[2] = {'D', 'S'};
+  static const char *LABEL[2] = {"DYNAMIC", "STATIC"};
+  int y = hy + SVC_HDR_H;
+
   if (!expanded) {
-    // COMPACT: active services only, two columns of dot + name
+    // COMPACT: per group, a small label then the active services, two columns
     const int colw = (QUEUE_PANEL_W - lx) / 2, rowh = 16;
-    int maxrows = (bottom - y) / rowh;
-    if (maxrows < 1) return;
-    int slots = maxrows * 2, k = 0, drawn = 0;
     if (sv->nup == 0) {
-      wtext(back, W, H, STRIDE, lx, y, "NONE RESPONDING", 1, bad_r, bad_g, bad_b);
+      wtext(back, W, H, STRIDE, lx, y + 2, "NONE RESPONDING", 1, bad_r, bad_g, bad_b);
       return;
     }
-    for (int i = 0; i < sv->n; i++) {
-      if (!sv->s[i].ok) continue;
-      if (k == slots - 1 && sv->nup > slots) {   // last slot says what didn't fit
-        snprintf(buf, sizeof(buf), "+%d MORE", sv->nup - drawn);
-        wtext(back, W, H, STRIDE, lx + (k % 2) * colw + 10, y + (k / 2) * rowh, buf, 1, dim_r, dim_g, dim_b);
-        break;
+    for (int g = 0; g < 2; g++) {
+      int up = 0;
+      for (int i = 0; i < sv->n; i++) up += sv->s[i].kind == KINDS[g] && sv->s[i].ok;
+      if (!up) continue;
+      if (y + 12 + rowh > bottom) return;
+      wtext(back, W, H, STRIDE, lx, y, LABEL[g], 1, dim_r * 0.8f, dim_g * 0.8f, dim_b * 0.8f);
+      y += 12;
+      int slots = ((bottom - y) / rowh) * 2, k = 0;
+      for (int i = 0; i < sv->n && slots > 0; i++) {
+        const SvcItem *it = &sv->s[i];
+        if (it->kind != KINDS[g] || !it->ok) continue;
+        int cx = lx + (k % 2) * colw, cy = y + (k / 2) * rowh;
+        if (k == slots - 1 && up > slots) {      // last slot says what didn't fit
+          snprintf(buf, sizeof(buf), "+%d MORE", up - k);
+          wtext(back, W, H, STRIDE, cx + 10, cy, buf, 1, dim_r, dim_g, dim_b);
+          k++;
+          break;
+        }
+        svc_dot(back, W, H, STRIDE, cx, cy, 7, ok_r, ok_g, ok_b);
+        wtext(back, W, H, STRIDE, cx + 12, cy, it->name, 1, cyan_r, cyan_g, cyan_b);
+        k++;
       }
-      int cx = lx + (k % 2) * colw, cy = y + (k / 2) * rowh;
-      svc_dot(back, W, H, STRIDE, cx, cy, 7, ok_r, ok_g, ok_b);
-      wtext(back, W, H, STRIDE, cx + 12, cy, sv->s[i].name, 1, cyan_r, cyan_g, cyan_b);
-      k++; drawn++;
+      y += ((k + 1) / 2) * rowh + 4;
     }
     return;
   }
 
-  // EXPANDED: every service, active first (with round trip), then the failures
-  const int rowh = 24;
-  int row = 0, maxrows = (bottom - y) / rowh;
-  for (int pass = 1; pass >= 0; pass--) {
-    for (int i = 0; i < sv->n && row < maxrows; i++) {
-      const SvcItem *it = &sv->s[i];
-      if (it->ok != pass) continue;
-      int yy = y + row * rowh;
-      float r = pass ? ok_r : bad_r, g = pass ? ok_g : bad_g, b = pass ? ok_b : bad_b;
-      svc_dot(back, W, H, STRIDE, lx, yy + 3, 8, r, g, b);
-      wtext(back, W, H, STRIDE, lx + 14, yy, it->name, 2,
-            pass ? cyan_r : bad_r, pass ? cyan_g : bad_g, pass ? cyan_b : bad_b);
-      if (pass) snprintf(buf, sizeof(buf), "%dMS", it->ms);
-      else      snprintf(buf, sizeof(buf), "%.10s", it->detail[0] ? it->detail : "DOWN");
-      wtext_r(back, W, H, STRIDE, QUEUE_PANEL_W - 8, yy + 4, buf, 1,
-              pass ? dim_r : bad_r, pass ? dim_g : bad_g, pass ? dim_b : bad_b);
-      row++;
+  // EXPANDED: every service, by group; active first (round trip), then failures
+  const int rowh = 22;
+  for (int g = 0; g < 2; g++) {
+    int any = 0;
+    for (int i = 0; i < sv->n; i++) any |= sv->s[i].kind == KINDS[g];
+    if (!any) continue;
+    if (y + 12 + rowh > bottom) break;
+    wtext(back, W, H, STRIDE, lx, y, LABEL[g], 1, dim_r * 0.8f, dim_g * 0.8f, dim_b * 0.8f);
+    y += 12;
+    for (int pass = 1; pass >= 0; pass--) {
+      for (int i = 0; i < sv->n; i++) {
+        const SvcItem *it = &sv->s[i];
+        if (it->kind != KINDS[g] || it->ok != pass) continue;
+        if (y + rowh > bottom + 6) {
+          wtext(back, W, H, STRIDE, lx + 14, y, "...", 1, dim_r, dim_g, dim_b);
+          return;
+        }
+        float r = pass ? ok_r : bad_r, gg = pass ? ok_g : bad_g, b = pass ? ok_b : bad_b;
+        svc_dot(back, W, H, STRIDE, lx, y + 3, 8, r, gg, b);
+        wtext(back, W, H, STRIDE, lx + 14, y, it->name, 2,
+              pass ? cyan_r : bad_r, pass ? cyan_g : bad_g, pass ? cyan_b : bad_b);
+        if (pass) snprintf(buf, sizeof(buf), "%dMS", it->ms);
+        else      snprintf(buf, sizeof(buf), "%.10s", it->detail[0] ? it->detail : "DOWN");
+        wtext_r(back, W, H, STRIDE, QUEUE_PANEL_W - 8, y + 4, buf, 1,
+                pass ? dim_r : bad_r, pass ? dim_g : bad_g, pass ? dim_b : bad_b);
+        y += rowh;
+      }
     }
+    y += 4;
   }
-  if (row < sv->n)
-    wtext(back, W, H, STRIDE, lx + 14, y + row * rowh, "...", 1, dim_r, dim_g, dim_b);
 }
 
 #endif
