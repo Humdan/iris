@@ -372,6 +372,57 @@ static void read_stats(FeedStats *st) {
 #define QUEUE_PANEL_W ((int)LAY.queue_x + 248) // touch-active width of the column
 #define QUEUE_VISIBLE ((int)LAY.queue_rows)   // max rows drawn at once
 
+// ---- expandable left-column widgets ----
+// The cron QUEUE and the SERVICES list share the left column and each has two
+// sizes: COMPACT (the default: one line per job, a two-column service grid)
+// and EXPANDED (full two-line job rows / a detailed service list). At most one
+// is expanded at a time -- it takes the column and its neighbour folds to its
+// header line. The [+]/[-] box on a header toggles it on the glass; the state
+// lives in EXPAND_FILE so it survives restarts and the dashboard can flip it.
+// iris_fb.c's hit-tests use these same macros, so drawn == touchable.
+typedef struct { int queue, services; } ExpandState;
+static ExpandState EXP;                      // zeroed = everything compact
+#define EXPAND_FILE     "/tmp/iris_expand"
+#define CRON_ROW_H      (EXP.queue ? QUEUE_ROW_H : 22)
+#define EXP_BOX_W       26
+#define EXP_BOX_H       18
+#define EXP_BOX_X       (QUEUE_PANEL_W - EXP_BOX_W - 6)
+#define LEFT_COL_BOTTOM ((int)LAY.panel_y - 14)  // just above the bottom panel's fill
+#define SVC_HDR_H       22
+
+static int svc_enabled(void) { return (int)LAY.services_enabled; }
+
+// Cron rows visible in the left column for the current expand state.
+static int cron_visible(void) {
+  if (EXP.services && svc_enabled()) return 0;            // folded to its header
+  if (!EXP.queue) return QUEUE_VISIBLE;
+  int bottom = LEFT_COL_BOTTOM - (svc_enabled() ? SVC_HDR_H + 8 : 0);
+  int n = (bottom - QUEUE_LY) / QUEUE_ROW_H;
+  return n < 1 ? 1 : n;
+}
+
+// Top of the SERVICES header text.
+static int svc_header_y(void) {
+  if (EXP.services) return QUEUE_LY + 2;                  // right under the folded queue header
+  if (EXP.queue)    return LEFT_COL_BOTTOM - SVC_HDR_H + 6; // folded to the column foot
+  return QUEUE_LY + QUEUE_VISIBLE * 22 + 8;               // under the compact queue
+}
+
+// The [+]/[-] toggle box drawn at the right end of a header line.
+static void draw_expand_box(uint16_t *back, int W, int H, int STRIDE, int y, int expanded) {
+  int x = EXP_BOX_X;
+  const float br = 0.22f, bg = 0.30f, bb = 0.38f;
+  for (int i = 0; i < EXP_BOX_W; i++) {
+    wput(back, W, H, STRIDE, x + i, y, br, bg, bb);
+    wput(back, W, H, STRIDE, x + i, y + EXP_BOX_H - 1, br, bg, bb);
+  }
+  for (int j = 0; j < EXP_BOX_H; j++) {
+    wput(back, W, H, STRIDE, x, y + j, br, bg, bb);
+    wput(back, W, H, STRIDE, x + EXP_BOX_W - 1, y + j, br, bg, bb);
+  }
+  wtext(back, W, H, STRIDE, x + 8, y + 2, expanded ? "-" : "+", 2, 0.35f, 0.75f, 0.95f);
+}
+
 // Render clock (top) + cron job queue (left column).
 // scroll: number of jobs scrolled off the top (already clamped by caller).
 // sel:    selected job index, or -1 if none (drawn highlighted).
@@ -397,7 +448,10 @@ static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const FeedSta
   int lx = QUEUE_LX, ly = QUEUE_LY;
   char hdr[24]; snprintf(hdr, sizeof(hdr), "QUEUE %d", st->njobs);
   wtext(back, W, H, STRIDE, lx, ly - 28, hdr, 2, dim_r, dim_g, dim_b);
+  draw_expand_box(back, W, H, STRIDE, ly - 30, EXP.queue && !EXP.services);
 
+  const int vis = cron_visible(), rowh = CRON_ROW_H;
+  if (vis == 0) return;                          // SERVICES is expanded: header only
   if (st->njobs == 0) {
     wtext(back, W, H, STRIDE, lx, ly, "NO JOBS", 2, dim_r, dim_g, dim_b);
     return;
@@ -405,11 +459,11 @@ static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const FeedSta
   if (scroll < 0) scroll = 0;
   if (scroll > st->njobs - 1) scroll = st->njobs - 1;
   int shown = 0;
-  for (int i = scroll; i < st->njobs && shown < QUEUE_VISIBLE; i++, shown++) {
-    int yy = ly + shown * QUEUE_ROW_H;
+  for (int i = scroll; i < st->njobs && shown < vis; i++, shown++) {
+    int yy = ly + shown * rowh;
     // selected-row highlight band
     if (i == sel) {
-      for (int by = -6; by < QUEUE_ROW_H - 8; by++)
+      for (int by = (EXP.queue ? -6 : -4); by < rowh - (EXP.queue ? 8 : 6); by++)
         for (int bx = -4; bx < QUEUE_PANEL_W - QUEUE_LX; bx++)
           wput(back, W, H, STRIDE, lx + bx, yy + by, 0.10f, 0.16f, 0.22f);
     }
@@ -426,6 +480,14 @@ static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const FeedSta
     float nr = is_ns ? err_r : cyan_r;
     float ng = is_ns ? err_g : cyan_g;
     float nb = is_ns ? err_b : cyan_b;
+    if (!EXP.queue) {
+      // COMPACT: one line -- name (clipped to leave room) + when, right-aligned
+      char nm[16]; snprintf(nm, sizeof(nm), "%.13s", st->names[i]);
+      wtext(back, W, H, STRIDE, lx + 14, yy, nm, 2, nr, ng, nb);
+      char wb[12]; snprintf(wb, sizeof(wb), "%.8s", st->when[i]);
+      wtext_r(back, W, H, STRIDE, QUEUE_PANEL_W - 8, yy + 4, wb, 1, dim_r, dim_g, dim_b);
+      continue;
+    }
     wtext(back, W, H, STRIDE, lx + 14, yy, st->names[i], 2, nr, ng, nb);
     char whenbuf[28];
     if (st->copies[i] > 1) snprintf(whenbuf, sizeof(whenbuf), "%s  X%d", st->when[i], st->copies[i]);
@@ -433,10 +495,19 @@ static void draw_widgets(uint16_t *back, int W, int H, int STRIDE, const FeedSta
     wtext(back, W, H, STRIDE, lx + 14, yy + 18, whenbuf, 1, dim_r, dim_g, dim_b);
   }
   // scroll affordance: little up/down chevrons if more jobs exist off-screen
-  if (scroll > 0)
-    wtext(back, W, H, STRIDE, QUEUE_PANEL_W - 20, ly - 12, "-", 2, dim_r, dim_g, dim_b);
-  if (scroll + QUEUE_VISIBLE < st->njobs)
-    wtext(back, W, H, STRIDE, QUEUE_PANEL_W - 20, ly + (QUEUE_VISIBLE - 1) * QUEUE_ROW_H + 20, "_", 2, dim_r, dim_g, dim_b);
+  // Compact rows use the full width (name + when), so there the markers go
+  // small in the left margin, just above the first dot / below the last one.
+  if (EXP.queue) {
+    if (scroll > 0)
+      wtext(back, W, H, STRIDE, QUEUE_PANEL_W - 20, ly - 12, "-", 2, dim_r, dim_g, dim_b);
+    if (scroll + vis < st->njobs)
+      wtext(back, W, H, STRIDE, QUEUE_PANEL_W - 20, ly + (vis - 1) * rowh + 20, "_", 2, dim_r, dim_g, dim_b);
+  } else {
+    if (scroll > 0)
+      wtext(back, W, H, STRIDE, lx + 1, ly - 8, "-", 1, dim_r, dim_g, dim_b);
+    if (scroll + vis < st->njobs)
+      wtext(back, W, H, STRIDE, lx + 1, ly + vis * rowh - 10, "_", 1, dim_r, dim_g, dim_b);
+  }
 }
 
 // Solid filled rectangle (opaque set) into the back buffer.

@@ -24,6 +24,7 @@
 #include <sys/file.h>
 #include "iris_widgets.h"
 #include "iris_organism.h"
+#include "iris_services.h"
 
 static volatile int running = 1;
 static void on_sig(int s) { (void)s; running = 0; }
@@ -76,6 +77,38 @@ static void left_view_write(int v) {
 
 // Adopt a change made anywhere else (the dashboard, a script) the same way the
 // NIGHT pill does, so the column can be switched without reaching for the glass.
+// Expand/compact state of the left-column widgets (see iris_widgets.h).
+// "queue=0|1" and "services=0|1" lines; a missing file means both compact.
+static time_t expand_mtime = 0;
+
+static void expand_write(void) {
+    FILE *f = fopen(EXPAND_FILE, "w");
+    if (f) { fprintf(f, "queue=%d\nservices=%d\n", EXP.queue, EXP.services); fclose(f); chmod(EXPAND_FILE, 0666); }
+    struct stat st;
+    if (stat(EXPAND_FILE, &st) == 0) expand_mtime = st.st_mtime;
+}
+
+// Adopt a change made elsewhere (the dashboard). Returns 1 if EXP changed.
+static int expand_poll(void) {
+    struct stat st;
+    if (stat(EXPAND_FILE, &st) != 0 || st.st_mtime == expand_mtime) return 0;
+    expand_mtime = st.st_mtime;
+    FILE *f = fopen(EXPAND_FILE, "r");
+    if (!f) return 0;
+    ExpandState e = {0, 0};
+    char line[32];
+    while (fgets(line, sizeof(line), f)) {
+        int v;
+        if (sscanf(line, "queue=%d", &v) == 1) e.queue = v != 0;
+        else if (sscanf(line, "services=%d", &v) == 1) e.services = v != 0;
+    }
+    fclose(f);
+    if (e.queue && e.services) e.services = 0;     // one expanded at a time
+    int changed = e.queue != EXP.queue || e.services != EXP.services;
+    EXP = e;
+    return changed;
+}
+
 static int left_view_poll(int cur) {
     struct stat st;
     if (stat(LEFT_VIEW_FILE, &st) != 0) return cur;
@@ -416,6 +449,9 @@ int main(int argc, char **argv) {
     // FIRING feedback timestamp set when the RUN NOW button is tapped.
         NightConsole ns_con; memset(&ns_con, 0, sizeof(ns_con));
         static NsView ns_view;       // running cron lanes + announced tasks (~1Hz)
+        static SvcStats services;    // heartbeat ping results (~1Hz)
+        static int svc_init = 0;
+        if (!svc_init) { svc_init = 1; read_services(&services); expand_poll(); }
         double ns_last_read = 0;     // last transcript read (monotonic)
         double ns_fire_at   = -1e9;  // time the NIGHT SHIFT button was tapped
         // Hermes only notices a manual run on its next cron tick (every 60s,
@@ -494,7 +530,7 @@ int main(int argc, char **argv) {
                 pitch_offset += (float)dy * ang_per_px;              // immediate pitch follow
             } else if (gesture_is_vertical) {
                 // swipe up -> scroll down the list; QUEUE_ROW_H px per job
-                int rows = -total_dy / QUEUE_ROW_H;   // finger up (dy<0) advances list
+                int rows = -total_dy / (left_view ? QUEUE_ROW_H : CRON_ROW_H);   // finger up (dy<0) advances list
                 scroll_target = gesture_scroll_anchor + rows;
             }
             prev_x = tx; prev_y = ty;
@@ -542,6 +578,27 @@ int main(int argc, char **argv) {
                     ns_manual_prev = ns_manual;
                     handled = 1;
                 }
+                // Expand/compact: the [+]/[-] box on the QUEUE header, or anywhere
+                // on the SERVICES header. Cron view only (the night queue has no
+                // services beside it). Expanding one compacts the other.
+                if (!handled && LAY.queue_enabled && left_view == 0 &&
+                    upx >= EXP_BOX_X - 10 && upx < QUEUE_PANEL_W + 4 &&
+                    upy >= QUEUE_LY - 40 && upy < QUEUE_LY - 6) {
+                    EXP.queue = !EXP.queue;
+                    if (EXP.queue) EXP.services = 0;
+                    expand_write();
+                    scroll_target = 0; sel_job = -1;
+                    handled = 1;
+                }
+                if (!handled && LAY.queue_enabled && svc_enabled() && left_view == 0 &&
+                    upx < QUEUE_PANEL_W + 4 &&
+                    upy >= svc_header_y() - 10 && upy < svc_header_y() + SVC_HDR_H) {
+                    EXP.services = !EXP.services;
+                    if (EXP.services) EXP.queue = 0;
+                    expand_write();
+                    scroll_target = 0; sel_job = -1;
+                    handled = 1;
+                }
                 // Column header: switch between the cron queue and the night queue.
                 if (!handled && LAY.queue_enabled && upx < QUEUE_PANEL_W &&
                     upy >= QUEUE_LY - 40 && upy < QUEUE_LY - 6) {
@@ -562,9 +619,9 @@ int main(int argc, char **argv) {
                     }
                 }
                 if (!handled && left_view == 0 && LAY.queue_enabled && upx < QUEUE_PANEL_W && upy >= QUEUE_LY - 6) {
-                    int row = (upy - QUEUE_LY) / QUEUE_ROW_H;
+                    int row = (upy - QUEUE_LY) / CRON_ROW_H;
                     int idx = scroll_target + row;
-                    if (row >= 0 && row < QUEUE_VISIBLE && idx >= 0 && idx < stats.njobs) {
+                    if (row >= 0 && row < cron_visible() && idx >= 0 && idx < stats.njobs) {
                         sel_job = (sel_job == idx) ? -1 : idx;  // toggle
                         if (sel_job >= 0 && strcmp(stats.names[sel_job], NS_JOB_NAME) == 0)
                             ns_last_read = 0;   // force an immediate transcript read on open
@@ -579,7 +636,7 @@ int main(int argc, char **argv) {
         // clamp scroll target to valid range and ease scroll_f toward it
         {
             int items = (left_view == 1) ? ns_queue.n : stats.njobs;
-            int maxs = items - QUEUE_VISIBLE; if (maxs < 0) maxs = 0;
+            int maxs = items - ((left_view == 1) ? QUEUE_VISIBLE : cron_visible()); if (maxs < 0) maxs = 0;
             if (scroll_target < 0) scroll_target = 0;
             if (scroll_target > maxs) scroll_target = maxs;
             scroll_f += ((float)scroll_target - scroll_f) * (1.0f - expf(-12.0f * dt));
@@ -653,6 +710,8 @@ int main(int argc, char **argv) {
         if (t - tstats > 1.0) {
             tstats = t; read_stats(&stats); read_agent_stats(&agent); read_portfolio_stats(&portfolio);
             layout_poll(&LAY, layout_path, W, H);
+            read_services(&services);
+            if (expand_poll()) { scroll_target = 0; sel_job = -1; }
             read_ns_queue(&ns_queue);
             if (ns_sel >= ns_queue.n) ns_sel = -1;   // row vanished from the queue
             {
@@ -723,6 +782,8 @@ int main(int argc, char **argv) {
         draw_widgets(back, W, H, STRIDE, &stats, (int)(scroll_f + 0.5f), sel_job,
                      !show_log && left_view == 0);
         // left_view is a deliberate choice, so it outranks the automatic console.
+        if (!show_log && left_view == 0 && LAY.queue_enabled && svc_enabled())
+            draw_services(back, W, H, STRIDE, &services);
         if (left_view == 1 && LAY.queue_enabled)
             draw_ns_queue(back, W, H, STRIDE, &ns_queue, (int)(scroll_f + 0.5f), ns_sel);
 

@@ -28,6 +28,7 @@
   X("queue.x",            queue_x)          \
   X("queue.y",            queue_y)          \
   X("queue.rows",         queue_rows)       \
+  X("services.enabled",   services_enabled) \
   X("panel.enabled",      panel_enabled)    \
   X("panel.y",            panel_y)          \
   X("portfolio.enabled",  portfolio_enabled)\
@@ -51,6 +52,7 @@ static void layout_defaults(IrisLayout *L, int W, int H) {
   memset(L, 0, sizeof(*L));
   L->clock_enabled = 1;  L->clock_x = W / 2.0f; L->clock_y = 10;
   L->queue_enabled = 1;  L->queue_x = 12;       L->queue_y = 116; L->queue_rows = 6;
+  L->services_enabled = 1;
   L->panel_enabled = 1;  L->panel_y = H - 70.0f;
   L->portfolio_enabled = 1; L->portfolio_x = W - 300.0f;
   L->orbs_enabled = 1;

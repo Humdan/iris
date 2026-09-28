@@ -1,0 +1,11 @@
+[Unit]
+Description=Iris service heartbeat (pings services for the LCD SERVICES widget)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/dev/iris/iris_heartbeat.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
