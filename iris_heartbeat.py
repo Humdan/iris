@@ -163,7 +163,9 @@ def services():
         for s in json.loads(SITES.read_text()).get("sites", []):
             if not s.get("url"):
                 continue
-            kind = "D" if (s.get("service") or {}).get("kind") == "dynamic" else "S"
+            if (s.get("service") or {}).get("kind") != "dynamic":
+                continue   # static sites aren't shown; the nightly site-check covers them
+            kind = "D"
             every = 600 if ((s.get("service") or {}).get("check") or {}).get("fresh") else 60
             svc.append((s.get("id", s["url"]).upper()[:10], kind, every, lambda s=s: probe_site(s)))
     except (OSError, ValueError):

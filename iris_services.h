@@ -5,9 +5,9 @@
 // which rewrites SVC_FILE every beat; this side only reads it at the 1 Hz
 // stats cadence, so the render loop never blocks on a network probe.
 //
-// Services come in two groups: DYNAMIC (they do work -- serve other things,
-// run jobs, can be triggered) and STATIC (only answer when asked). The network
-// itself is the NET dot in the header, not a list entry.
+// Only DYNAMIC services are listed (they do work -- serve other things, run
+// jobs, can be triggered); static ones (only answer when asked) are left off
+// on purpose. The network itself is the NET dot in the header.
 //
 // COMPACT (default): header with an up/total count, then the active services
 // of each group as a two-column grid. EXPANDED: one row per service with its
@@ -52,6 +52,7 @@ static void read_services(SvcStats *sv) {
     int ok = 0, ms = 0; char kind = 'D';
     if (sscanf(line, "%31[^|]|%d|%d|%c|%63[^\n]", name, &ok, &ms, &kind, detail) < 4) continue;
     if (kind == 'N') { sv->net = ok; continue; }
+    if (kind == 'S') continue;                  // static: not shown
     snprintf(it->name, sizeof(it->name), "%s", name);
     snprintf(it->detail, sizeof(it->detail), "%s", detail);
     for (char *p = it->detail; *p; p++) *p = (char)toupper((unsigned char)*p);  // font is A-Z only
@@ -102,73 +103,52 @@ static void draw_services(uint16_t *back, int W, int H, int STRIDE, const SvcSta
   if (EXP.queue && !expanded) return;          // folded under an expanded queue
   if (sv->stale) return;                       // a dead heartbeat proves nothing is up
 
-  static const char KINDS[2] = {'D', 'S'};
-  static const char *LABEL[2] = {"DYNAMIC", "STATIC"};
-  int y = hy + SVC_HDR_H;
+  int y = hy + SVC_HDR_H + 2;
 
   if (!expanded) {
-    // COMPACT: per group, a small label then the active services, two columns
+    // COMPACT: the active services, two columns of dot + name
     const int colw = (QUEUE_PANEL_W - lx) / 2, rowh = 16;
     if (sv->nup == 0) {
-      wtext(back, W, H, STRIDE, lx, y + 2, "NONE RESPONDING", 1, bad_r, bad_g, bad_b);
+      wtext(back, W, H, STRIDE, lx, y, "NONE RESPONDING", 1, bad_r, bad_g, bad_b);
       return;
     }
-    for (int g = 0; g < 2; g++) {
-      int up = 0;
-      for (int i = 0; i < sv->n; i++) up += sv->s[i].kind == KINDS[g] && sv->s[i].ok;
-      if (!up) continue;
-      if (y + 12 + rowh > bottom) return;
-      wtext(back, W, H, STRIDE, lx, y, LABEL[g], 1, dim_r * 0.8f, dim_g * 0.8f, dim_b * 0.8f);
-      y += 12;
-      int slots = ((bottom - y) / rowh) * 2, k = 0;
-      for (int i = 0; i < sv->n && slots > 0; i++) {
-        const SvcItem *it = &sv->s[i];
-        if (it->kind != KINDS[g] || !it->ok) continue;
-        int cx = lx + (k % 2) * colw, cy = y + (k / 2) * rowh;
-        if (k == slots - 1 && up > slots) {      // last slot says what didn't fit
-          snprintf(buf, sizeof(buf), "+%d MORE", up - k);
-          wtext(back, W, H, STRIDE, cx + 10, cy, buf, 1, dim_r, dim_g, dim_b);
-          k++;
-          break;
-        }
-        svc_dot(back, W, H, STRIDE, cx, cy, 7, ok_r, ok_g, ok_b);
-        wtext(back, W, H, STRIDE, cx + 12, cy, it->name, 1, cyan_r, cyan_g, cyan_b);
-        k++;
+    int slots = ((bottom - y) / rowh) * 2, k = 0;
+    for (int i = 0; i < sv->n && slots > 0; i++) {
+      const SvcItem *it = &sv->s[i];
+      if (!it->ok) continue;
+      int cx = lx + (k % 2) * colw, cy = y + (k / 2) * rowh;
+      if (k == slots - 1 && sv->nup > slots) {   // last slot says what didn't fit
+        snprintf(buf, sizeof(buf), "+%d MORE", sv->nup - k);
+        wtext(back, W, H, STRIDE, cx + 10, cy, buf, 1, dim_r, dim_g, dim_b);
+        break;
       }
-      y += ((k + 1) / 2) * rowh + 4;
+      svc_dot(back, W, H, STRIDE, cx, cy, 7, ok_r, ok_g, ok_b);
+      wtext(back, W, H, STRIDE, cx + 12, cy, it->name, 1, cyan_r, cyan_g, cyan_b);
+      k++;
     }
     return;
   }
 
-  // EXPANDED: every service, by group; active first (round trip), then failures
-  const int rowh = 22;
-  for (int g = 0; g < 2; g++) {
-    int any = 0;
-    for (int i = 0; i < sv->n; i++) any |= sv->s[i].kind == KINDS[g];
-    if (!any) continue;
-    if (y + 12 + rowh > bottom) break;
-    wtext(back, W, H, STRIDE, lx, y, LABEL[g], 1, dim_r * 0.8f, dim_g * 0.8f, dim_b * 0.8f);
-    y += 12;
-    for (int pass = 1; pass >= 0; pass--) {
-      for (int i = 0; i < sv->n; i++) {
-        const SvcItem *it = &sv->s[i];
-        if (it->kind != KINDS[g] || it->ok != pass) continue;
-        if (y + rowh > bottom + 6) {
-          wtext(back, W, H, STRIDE, lx + 14, y, "...", 1, dim_r, dim_g, dim_b);
-          return;
-        }
-        float r = pass ? ok_r : bad_r, gg = pass ? ok_g : bad_g, b = pass ? ok_b : bad_b;
-        svc_dot(back, W, H, STRIDE, lx, y + 3, 8, r, gg, b);
-        wtext(back, W, H, STRIDE, lx + 14, y, it->name, 2,
-              pass ? cyan_r : bad_r, pass ? cyan_g : bad_g, pass ? cyan_b : bad_b);
-        if (pass) snprintf(buf, sizeof(buf), "%dMS", it->ms);
-        else      snprintf(buf, sizeof(buf), "%.10s", it->detail[0] ? it->detail : "DOWN");
-        wtext_r(back, W, H, STRIDE, QUEUE_PANEL_W - 8, y + 4, buf, 1,
-                pass ? dim_r : bad_r, pass ? dim_g : bad_g, pass ? dim_b : bad_b);
-        y += rowh;
+  // EXPANDED: every service, active first (round trip), then failures in red
+  const int rowh = 24;
+  for (int pass = 1; pass >= 0; pass--) {
+    for (int i = 0; i < sv->n; i++) {
+      const SvcItem *it = &sv->s[i];
+      if (it->ok != pass) continue;
+      if (y + rowh > bottom + 6) {
+        wtext(back, W, H, STRIDE, lx + 14, y, "...", 1, dim_r, dim_g, dim_b);
+        return;
       }
+      float r = pass ? ok_r : bad_r, g = pass ? ok_g : bad_g, b = pass ? ok_b : bad_b;
+      svc_dot(back, W, H, STRIDE, lx, y + 3, 8, r, g, b);
+      wtext(back, W, H, STRIDE, lx + 14, y, it->name, 2,
+            pass ? cyan_r : bad_r, pass ? cyan_g : bad_g, pass ? cyan_b : bad_b);
+      if (pass) snprintf(buf, sizeof(buf), "%dMS", it->ms);
+      else      snprintf(buf, sizeof(buf), "%.10s", it->detail[0] ? it->detail : "DOWN");
+      wtext_r(back, W, H, STRIDE, QUEUE_PANEL_W - 8, y + 4, buf, 1,
+              pass ? dim_r : bad_r, pass ? dim_g : bad_g, pass ? dim_b : bad_b);
+      y += rowh;
     }
-    y += 4;
   }
 }
 
