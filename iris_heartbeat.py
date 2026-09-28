@@ -37,6 +37,7 @@ TIMEOUT = 6
 OUT = Path("/tmp/iris_services")
 HOME = Path.home()
 SITES = HOME / ".hermes" / "managed-sites.json"
+REGISTRY = HOME / ".config" / "services" / "registry.json"   # `svc` port registry
 
 
 def probe_http(url, must_contain=None):
@@ -152,13 +153,26 @@ def probe_site(site):
 def services():
     """(NAME, KIND, EVERY, probe). NAME is what the LCD prints: <= 10 chars."""
     svc = [
-        ("DASHBOARD",  "D", 0, lambda: probe_json("http://127.0.0.1:8080/api/lcd/state", "clock")),
         ("GATEWAY",    "D", 0, probe_gateway),
         ("SESSIONS",   "D", 0, lambda: probe_fresh("/tmp/iris_sessions.json", 20)),
         ("TAILSCALE",  "D", 0, probe_tailscale),
         ("RPICONNECT", "D", 0, lambda: probe_cmd(["rpi-connect", "status"], "Signed in: yes")),
         ("INTERNET",   "N", 0, lambda: probe_icmp("1.1.1.1")),
     ]
+    # Apps in the port registry (`svc list`): each one with a health path is
+    # probed on its registered port, so registering an app is enough to put
+    # it on the LCD.
+    try:
+        for name, a in json.loads(REGISTRY.read_text()).get("apps", {}).items():
+            if not a.get("health"):
+                continue
+            url = f"http://127.0.0.1:{a['port']}{a['health']}"
+            key = a.get("health_json_key")
+            probe = (lambda u=url, k=key: probe_json(u, k)) if key else (lambda u=url: probe_http(u))
+            kind = "S" if a.get("kind") == "static" else "D"
+            svc.insert(0, ((a.get("label") or name).upper()[:10], kind, 0, probe))
+    except (OSError, ValueError):
+        pass
     try:
         for s in json.loads(SITES.read_text()).get("sites", []):
             if not s.get("url"):
