@@ -193,26 +193,52 @@ static int ns_manual_expire(int ns_manual, int ns_running) {
 #define NS_TOGGLE_H (NS_PILL_H + 20)
 
 // Running agents for the gyroscope comets. Registry lines, one per session:
-//   A|<c=claude h=hermes>|<session id>|<last active epoch>|<activity 0..1>
-// Written by the Claude Code hook and the Iris Hermes plugin. An agent counts
+//   A|<c=claude h=hermes>|<session id>|<last active epoch>|<activity 0..1>|<purpose u|s>
+// Written by the session watcher (and eventually the Claude Code hook). An agent counts
 // as running for AGENT_IDLE_S after its last activity, fading as it goes quiet.
+// Purpose: 'u' = working for Humdan (drives nucleus dilation), 's' = working for itself (drives ring precession)
 #define AGENTS_FILE  "/tmp/iris_agents.txt"
 #define AGENT_IDLE_S 120.0
+#define ORDER_FILE   "/tmp/iris_order"
+#define ORDER_STALE_S 900.0   // 15 minutes
+
+// Read order score from /tmp/iris_order. Lines: score|<0..1>, reason|..., at|<epoch>
+// Treat missing/stale >15 min as 1.0 (fully organized).
+static float read_order_score(void) {
+    FILE *f = fopen(ORDER_FILE, "r");
+    if (!f) return 1.0f;
+    char line[256];
+    float score = 1.0f;
+    time_t now = time(NULL);
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "score|", 6) == 0) {
+            float s; long long at;
+            if (sscanf(line, "score|%f|%*[^|]|%lld", &s, &at) >= 1) {
+                if (now - at <= ORDER_STALE_S) score = s;
+            }
+        }
+    }
+    fclose(f);
+    return score < 0 ? 0 : (score > 1 ? 1 : score);
+}
+
 static int read_agents(OrgAgentIn *out, int max) {
     FILE *f = fopen(AGENTS_FILE, "r");
     if (!f) return 0;
     char line[256]; int n = 0;
     time_t wall = time(NULL);
     while (n < max && fgets(line, sizeof(line), f)) {
-        char kind, id[128]; double last; float a;
-        if (sscanf(line, "A|%c|%127[^|]|%lf|%f", &kind, id, &last, &a) != 4) continue;
+        char kind, id[128], purpose = 'u'; double last; float a;
+        // Try 6-field format first, fall back to 5-field
+        if (sscanf(line, "A|%c|%127[^|]|%lf|%f|%c", &kind, id, &last, &a, &purpose) < 4) continue;
+        if (purpose != 'u' && purpose != 's') purpose = 'u';
         double age = (double)wall - last;
         if (age > AGENT_IDLE_S || age < -60) continue;
         uint32_t h = 2166136261u;
         for (const char *q = id; *q; q++) { h ^= (uint8_t)*q; h *= 16777619u; }
         // full activity while recently active, easing down as the agent goes quiet
         float recency = age < 5 ? 1.0f : expf(-(float)(age - 5) / 40.0f);
-        out[n++] = (OrgAgentIn){ h, kind == 'h' ? 'h' : 'c', a * recency };
+        out[n++] = (OrgAgentIn){ h, kind == 'h' ? 'h' : 'c', a * recency, purpose };
     }
     fclose(f);
     return n;
@@ -703,8 +729,18 @@ int main(int argc, char **argv) {
         static float night_w = 0.0f;
         int ns_starting = !ns_running && (t - ns_fire_at) < NS_START_WINDOW;
         night_w += ((ns_manual || ns_running || ns_starting ? 1.0f : 0.0f) - night_w) * (1.0f - expf(-3.0f * dt));
+        // Compute activity maxima per purpose from agents
+        OrgAgentIn ag[ORG_AGENTS]; int nag = read_agents(ag, ORG_AGENTS);
+        float u_max = 0, s_max = 0;
+        for (int i = 0; i < nag; i++) {
+            if (ag[i].purpose == 'u') u_max = fmaxf(u_max, ag[i].activity);
+            if (ag[i].purpose == 's') s_max = fmaxf(s_max, ag[i].activity);
+        }
+        float order_score = read_order_score();
+
         org_frame(back, W, H, STRIDE, ox, oy, escale, global_time, dt, act,
-                  yaw, pitch, heartbeat(beat_phase), beat_phase, night_w);
+                  yaw, pitch, heartbeat(beat_phase), beat_phase, night_w,
+                  u_max, s_max, order_score);
 
         // --- widgets: clock + system stats + agent panel on top of the orb ---
         if (t - tstats > 1.0) {
