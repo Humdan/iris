@@ -47,8 +47,11 @@ each open session:
 - **Status line** — shows the live session count in both idle and thinking modes.
 
 ```bash
-# Run the watcher (or let the systemd service do it)
+# Run the watcher manually
 python3 session_watcher.py --watch --interval 2
+
+# Or use the systemd user service (currently disabled):
+# systemctl --user enable --now session-watcher.service
 
 # Override the data path if you want to test with your own JSON
 export IRIS_SESSIONS_FILE=/path/to/sessions.json
