@@ -81,39 +81,76 @@ def compute_activity(idle_seconds):
     """Compute activity 0..1 from idle seconds. Active < 5s = 1.0, decays to 0 at 120s."""
     if idle_seconds < 5:
         return 1.0
-    if idle_seconds > 120:
+    if idle_seconds > AGENT_WINDOW_S:
         return 0.0
     # Exponential decay from 5s to 120s
     return max(0.0, min(1.0, 2.71828 ** (-(idle_seconds - 5) / 40.0)))
 
 
-def get_agent_kind(source):
-    """Map source to agent kind for iris_organism.h: 'c' for Claude, 'h' for Hermes."""
-    # For now, treat all Hermes sources as 'h' (orange comets)
-    # Claude Code sessions would need a hook to appear here
-    return 'h'
+# An agent counts as working while it produced output in the last 2 minutes.
+AGENT_WINDOW_S = 120
+CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 
 
-def write_agents_file(sessions):
+def hermes_agents(now):
+    """Hermes sessions that wrote a message recently.
+
+    sessions.last_activity_at is only set when a session starts, so it can't
+    tell a working session from an idle one; the newest message timestamp can.
+    Ended sessions still count for the window, so a short kanban worker shows up.
+    """
+    if not STATE_DB.exists():
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=1)
+        rows = conn.execute("""
+            SELECT s.id, s.source,
+                   (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = s.id) AS last_msg
+            FROM sessions s
+            WHERE s.started_at > ? AND (s.ended_at IS NULL OR s.ended_at = 0 OR s.ended_at > ?)
+        """, (now - 86400, now - AGENT_WINDOW_S)).fetchall()
+        conn.close()
+    except sqlite3.Error:
+        return []
+    agents = []
+    for sid, source, last_msg in rows:
+        if not last_msg or now - last_msg > AGENT_WINDOW_S:
+            continue
+        agents.append(('h', sid, last_msg, SOURCE_PURPOSE.get(source, 'u')))
+    return agents
+
+
+def claude_agents(now):
+    """Claude Code sessions: each transcript (~/.claude/projects/*/<id>.jsonl)
+    is appended to on every message and tool call, so its mtime is the
+    session's last activity. Claude Code works for Humdan: purpose 'u'."""
+    agents = []
+    try:
+        for f in CLAUDE_PROJECTS.glob("*/*.jsonl"):
+            mtime = f.stat().st_mtime
+            if now - mtime <= AGENT_WINDOW_S:
+                agents.append(('c', f.stem, mtime, 'u'))
+    except OSError:
+        pass
+    return agents
+
+
+def write_agents_file(now):
     """Write /tmp/iris_agents.txt with 6-field lines: A|kind|id|last_active|activity|purpose"""
+    agents = claude_agents(now) + hermes_agents(now)
+    agents.sort(key=lambda a: a[2], reverse=True)   # most recent first: the renderer shows 8
     lines = []
-    now = time.time()
-    for s in sessions:
-        last_active = s.get('last_activity_at') or s.get('started_at') or now
-        activity = compute_activity(s['idle_seconds'])
+    for kind, sid, last_active, purpose in agents:
+        activity = compute_activity(now - last_active)
         if activity <= 0:
             continue
-        kind = get_agent_kind(s['source'])
-        purpose = SOURCE_PURPOSE.get(s['source'], 'u')  # default to 'u' for unknown
-        # Old 5-field format (backward compatible): A|kind|id|last_active|activity
-        # New 6-field format: A|kind|id|last_active|activity|purpose
-        line = f"A|{kind}|{s['id']}|{last_active:.0f}|{activity:.3f}|{purpose}"
-        lines.append(line)
+        lines.append(f"A|{kind}|{sid}|{last_active:.0f}|{activity:.3f}|{purpose}")
 
     # Atomic write
     tmp = AGENTS_FILE.with_name(f'.{AGENTS_FILE.name}.{os.getpid()}.tmp')
     tmp.write_text('\n'.join(lines) + ('\n' if lines else ''))
     tmp.replace(AGENTS_FILE)
+    return lines
 
 
 def main():
@@ -143,7 +180,8 @@ def main():
             print(f"  {s['label']} ({s['source']}) idle {s['idle_seconds']:.0f}s")
 
         # Also write agents file for the renderer
-        write_agents_file(sessions)
+        for line in write_agents_file(time.time()):
+            print(f"  agent {line}")
 
     if args.watch:
         print(f"Watching Hermes sessions -> {output_path}")

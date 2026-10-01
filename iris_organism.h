@@ -330,6 +330,13 @@ static inline void org_plot_rgb(const OrgProj *pj, float x, float y, float z, fl
   org_splat(bx + 0.6f, by + 0.6f, r * dc * 0.5f, g * dc * 0.5f, b * dc * 0.5f);
 }
 
+// How chaotic the setup is (0 calm .. 1 chaotic) from the order score. A
+// tidy setup (>= 0.95) is perfectly calm; 0.35 or below is full chaos.
+static inline float org_chaos(float order) {
+  float c = (0.95f - order) / 0.60f;
+  return c < 0 ? 0 : c > 1 ? 1 : c;
+}
+
 static void org_gyro(const OrgProj *pj, const M3 *G, float R, float dt, float t, float act, float night,
                     float u_max, float s_max, float order) {
   // ease comets, drop fully faded ones
@@ -344,24 +351,24 @@ static void org_gyro(const OrgProj *pj, const M3 *G, float R, float dt, float t,
   }
   org_ncomets = out;
   float b = fminf(busy / 2.0f, 1.0f);                 // 0 idle .. 1 (two fully busy agents)
-  // Order-driven coherence: low order = phase jitter, wobble, filament flicker
-  float jitter = 1.0f - order;   // 0 = organized, 1 = chaotic
-  float wob_amp = 0.025f + 0.035f * act + 0.025f * jitter;  // more wobble when chaotic
+  float jitter = org_chaos(order);
 
   // the armature: faint rings with tick marks, tinted like the body
   // Precession speed is driven by s_max (activity for self) and act
   float tint[3] = { 0.55f + 0.40f * night, 0.78f - 0.55f * night, 1.0f - 0.75f * night };   // whiter than the body
   M3 RM[ORG_GYRO_RINGS];
   for (int r = 0; r < ORG_GYRO_RINGS; r++) {
-    // Precession is driven by s_max (activity for self) and act
-    org_gyro_prec[r] += (0.025f + 0.16f * s_max + 0.03f * act) * dt * (r & 1 ? -1.0f : 1.0f);
-    // Low order: rings drift out of their neat aligned pose
-    float drift = jitter * 0.05f * sinf(t * 0.3f + r * 2.0f);
+    // Working for itself: the rings spin up (~6x faster at full s) and rock
+    // on their axes like a gyroscope under load.
+    org_gyro_prec[r] += (0.025f + 0.10f * b + 0.85f * s_max + 0.03f * act) * dt * (r & 1 ? -1.0f : 1.0f);
+    float nod = s_max * 0.35f * sinf(t * 1.3f + r * 2.1f);
+    // Chaotic setup: rings wander out of their neat aligned pose
+    float drift = jitter * 0.30f * sinf(t * 0.9f + r * 2.0f);
     RM[r] = m3_mul(*G, m3_mul(m3_rz(org_gyro_tilt[r][1] + org_gyro_prec[r] + drift),
-                             m3_rx(org_gyro_tilt[r][0] - drift * 0.5f)));
+                             m3_rx(org_gyro_tilt[r][0] - drift * 0.5f + nod)));
     float rr = org_gyro_r[r];
     int n = (int)(6.2831853f * rr * R / 1.3f);
-    float I0 = 0.16f + 0.16f * b;
+    float I0 = 0.16f + 0.16f * b + 0.30f * s_max;
     for (int k = 0; k < n; k++) {
       float a = 6.2831853f * k / n;
       float tick = fmodf(a, 6.2831853f / 24.0f) < 0.022f ? 3.0f : 1.0f;   // 24 tick marks
@@ -469,24 +476,23 @@ static void org_frame(uint16_t *back, int W, int H, int STRIDE, float ox, float 
 
   M3 G = m3_mul(m3_ry(yaw), m3_rx(pitch));
 
-  // Order-driven coherence: low order = phase jitter, wobble, filament flicker
-  float jitter = 1.0f - order;   // 0 = organized, 1 = chaotic
+  // Chaotic setup: shells fall out of sync, traces wobble and drop out
+  float jitter = org_chaos(order);
 
   // shell matrices: spin in-plane, tilt the pole to face the viewer, wobble
-  // Low order = phase jitter between shells, wobble, filament flicker
   M3 SM[ORG_SHELLS];
   for (int s = 0; s < ORG_SHELLS; s++) {
     OrgShell *sh = &org_shells[s];
     sh->spin += sh->spin_spd * speed * dt;
-    // Low order: shells drift out of sync, phase jitter between shells
-    float jitter_phase = jitter * 0.05f * sinf(t * 0.7f + s * 1.5f);
-    float wob = 0.10f * sinf(t * 0.13f + sh->wob_ph) + jitter * 0.05f * sinf(t * 0.5f + s * 2.3f);
+    // each shell gets its own off-beat tumble, so they stop moving as one
+    float jitter_phase = jitter * 0.35f * sinf(t * 1.7f + s * 1.5f);
+    float wob = 0.10f * sinf(t * 0.13f + sh->wob_ph) + jitter * 0.25f * sinf(t * 1.1f + s * 2.3f);
     SM[s] = m3_mul(G, m3_mul(m3_rx(1.5707963f + sh->tilt_x + wob),
                              m3_mul(m3_rz(sh->tilt_z - wob * 0.7f + jitter_phase), m3_ry(sh->spin))));
   }
 
   // --- circuit traces ---
-  float wob_amp = 0.025f + 0.035f * act + 0.025f * jitter;   // more wobble when chaotic
+  float wob_amp = 0.025f + 0.035f * act + 0.10f * jitter;   // more wobble when chaotic
   for (int i = 0; i < ORG_SEGS; i++) {
     OrgSeg *s = &org_segs[i];
     if (s->dormant > 0) {                   // dead: wait, then be reborn
@@ -497,7 +503,7 @@ static void org_frame(uint16_t *back, int W, int H, int STRIDE, float ox, float 
     s->age += dt * (0.35f + 1.65f * act);      // slow turnover at rest
     if (s->age >= s->life) { s->dormant = 0.5f + org_rand() * 5.0f; continue; }
     if (s->flick > 0) s->flick -= dt * 4.0f;
-    else if (org_rand() < dt * (0.004f + 0.026f * act)) s->flick = 1.0f;   // hologram dropout (rare at rest)
+    else if (org_rand() < dt * (0.004f + 0.026f * act + 0.35f * jitter)) s->flick = 1.0f;   // hologram dropout (rare at rest, constant when chaotic)
 
     float grow = fminf(s->age / 0.7f, 1.0f);
     float fade = fminf((s->life - s->age) / 1.2f, 1.0f);
@@ -562,25 +568,26 @@ static void org_frame(uint16_t *back, int W, int H, int STRIDE, float ox, float 
   }
 
   // --- core: spinning knot of small rings + a breathing glow ---
-  // Nucleus dilates with u_max (work for Humdan) - eased ~1s
+  // Working for Humdan: the nucleus dilates (~1.9x) and burns brighter.
+  // u_max arrives eased by the caller.
   float nucleus_dilate = u_max;  // 0 idle, 1 busy for Humdan
-  float nucleus_r = 0.07f + 0.13f * org_rand() + 0.08f * nucleus_dilate;
   for (int i = 0; i < ORG_CORE_RINGS; i++) {
     OrgRing *c = &org_core[i];
     c->spin += c->spd * speed * dt;
     M3 C = m3_mul(G, m3_mul(m3_rz(c->axis_rot + t * 0.2f * (i + 1) * 0.3f), m3_mul(m3_rx(c->axis_tilt), m3_ry(c->spin))));
-    float rr = c->radius * (1.0f + 0.15f * beat_pos) * (1.0f + 0.3f * nucleus_dilate);  // dilate with u_max
+    float rr = c->radius * (1.0f + 0.15f * beat_pos) * (1.0f + 0.9f * nucleus_dilate);
     int n = (int)(6.2831853f * rr * R / 1.2f) + 8;
     for (int k = 0; k < n; k++) {
       float ang = 6.2831853f * k / n;
       float p[3]; org_xf(&C, cosf(ang) * rr, 0, sinf(ang) * rr, p);
       float u = org_frac((float)k / n + c->spin * 0.16f);   // bright sweep around the ring
-      org_plot(&pj, p[0], p[1], p[2], level * (0.30f + 0.7f * u * u * u), 0.6f + u, gold);
+      org_plot(&pj, p[0], p[1], p[2], level * (0.30f + 0.7f * u * u * u) * (1.0f + 0.8f * nucleus_dilate),
+               0.6f + u + 0.6f * nucleus_dilate, gold);
     }
   }
   {
-    float cr = 0.11f * R * (1.0f + 0.30f * beat_pos);
-    float peak = level * (0.18f + 0.45f * beat_pos);
+    float cr = 0.11f * R * (1.0f + 0.30f * beat_pos) * (1.0f + 1.0f * nucleus_dilate);
+    float peak = level * (0.18f + 0.45f * beat_pos + 0.55f * nucleus_dilate);
     int rad = (int)(cr * 2.2f);
     float inv = 1.0f / (cr * cr);
     int c0 = ORG_N / 2;

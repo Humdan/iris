@@ -194,36 +194,38 @@ static int ns_manual_expire(int ns_manual, int ns_running) {
 
 // Running agents for the gyroscope comets. Registry lines, one per session:
 //   A|<c=claude h=hermes>|<session id>|<last active epoch>|<activity 0..1>|<purpose u|s>
-// Written by the session watcher (and eventually the Claude Code hook). An agent counts
-// as running for AGENT_IDLE_S after its last activity, fading as it goes quiet.
+// Written by session_watcher.py (Hermes sessions from state.db, Claude Code
+// sessions from their transcript mtimes). An agent counts as running for
+// AGENT_IDLE_S after its last activity, fading as it goes quiet.
 // Purpose: 'u' = working for Humdan (drives nucleus dilation), 's' = working for itself (drives ring precession)
+// IRIS_AGENTS_FILE / IRIS_ORDER_FILE override the paths (used to preview states with IRIS_SNAPSHOT).
 #define AGENTS_FILE  "/tmp/iris_agents.txt"
 #define AGENT_IDLE_S 120.0
 #define ORDER_FILE   "/tmp/iris_order"
-#define ORDER_STALE_S 900.0   // 15 minutes
+#define ORDER_STALE_S 900.0   // 15 minutes; iris-order.py rewrites it every 5
 
-// Read order score from /tmp/iris_order. Lines: score|<0..1>, reason|..., at|<epoch>
-// Treat missing/stale >15 min as 1.0 (fully organized).
+static const char *env_or(const char *name, const char *def) { const char *v = getenv(name); return v && *v ? v : def; }
+
+// Order score from iris-order.py, one key per line: score|<0..1>, reason|..., at|<epoch>.
+// Also accepts the older single-line "score|x, reason|..., at|n" form.
+// Missing or stale (>15 min) counts as 1.0 (fully organized).
 static float read_order_score(void) {
-    FILE *f = fopen(ORDER_FILE, "r");
+    FILE *f = fopen(env_or("IRIS_ORDER_FILE", ORDER_FILE), "r");
     if (!f) return 1.0f;
-    char line[256];
-    float score = 1.0f;
-    time_t now = time(NULL);
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "score|", 6) == 0) {
-            float s; long long at;
-            if (sscanf(line, "score|%f|%*[^|]|%lld", &s, &at) >= 1) {
-                if (now - at <= ORDER_STALE_S) score = s;
-            }
-        }
-    }
+    char buf[1024];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
+    buf[n] = 0;
+    const char *ps = strstr(buf, "score|"), *pa = strstr(buf, "at|");
+    float score; long long at;
+    if (!ps || sscanf(ps + 6, "%f", &score) != 1) return 1.0f;
+    if (!pa || sscanf(pa + 3, "%lld", &at) != 1) return 1.0f;
+    if (llabs((long long)time(NULL) - at) > ORDER_STALE_S) return 1.0f;
     return score < 0 ? 0 : (score > 1 ? 1 : score);
 }
 
 static int read_agents(OrgAgentIn *out, int max) {
-    FILE *f = fopen(AGENTS_FILE, "r");
+    FILE *f = fopen(env_or("IRIS_AGENTS_FILE", AGENTS_FILE), "r");
     if (!f) return 0;
     char line[256]; int n = 0;
     time_t wall = time(NULL);
@@ -433,6 +435,7 @@ int main(int argc, char **argv) {
 
     float act = 0, target = 0;
     double t0 = now(), tlast = t0, tcheck = 0, tfps = t0, tnext = t0, tstats = 0;
+    float u_target = 0, s_target = 0, order_target = 1;   // refreshed at 1 Hz with the stats
     int frames = 0;
     float global_time = 0;
     // Layout: dashboard-owned positions/visibility. Loaded before the first
@@ -729,18 +732,18 @@ int main(int argc, char **argv) {
         static float night_w = 0.0f;
         int ns_starting = !ns_running && (t - ns_fire_at) < NS_START_WINDOW;
         night_w += ((ns_manual || ns_running || ns_starting ? 1.0f : 0.0f) - night_w) * (1.0f - expf(-3.0f * dt));
-        // Compute activity maxima per purpose from agents
-        OrgAgentIn ag[ORG_AGENTS]; int nag = read_agents(ag, ORG_AGENTS);
-        float u_max = 0, s_max = 0;
-        for (int i = 0; i < nag; i++) {
-            if (ag[i].purpose == 'u') u_max = fmaxf(u_max, ag[i].activity);
-            if (ag[i].purpose == 's') s_max = fmaxf(s_max, ag[i].activity);
-        }
-        float order_score = read_order_score();
+        // Work for Humdan (u), work for itself (s) and how organized the setup
+        // is: targets are read at 1 Hz below, eased here so changes glide in
+        // over ~1 s instead of snapping.
+        static float u_now = 0, s_now = 0, order_now = 1;
+        float ease = 1.0f - expf(-2.5f * dt);
+        u_now += (u_target - u_now) * ease;
+        s_now += (s_target - s_now) * ease;
+        order_now += (order_target - order_now) * (1.0f - expf(-1.0f * dt));
 
         org_frame(back, W, H, STRIDE, ox, oy, escale, global_time, dt, act,
                   yaw, pitch, heartbeat(beat_phase), beat_phase, night_w,
-                  u_max, s_max, order_score);
+                  u_now, s_now, order_now);
 
         // --- widgets: clock + system stats + agent panel on top of the orb ---
         if (t - tstats > 1.0) {
@@ -767,6 +770,12 @@ int main(int argc, char **argv) {
                 OrgAgentIn ag[ORG_AGENTS];
                 int nag = read_agents(ag, ORG_AGENTS);
                 org_set_agents(ag, nag);
+                u_target = s_target = 0;
+                for (int i = 0; i < nag; i++) {
+                    if (ag[i].purpose == 'u') u_target = fmaxf(u_target, ag[i].activity);
+                    if (ag[i].purpose == 's') s_target = fmaxf(s_target, ag[i].activity);
+                }
+                order_target = read_order_score();
             }
             int lane_live = 0;
             for (int i = 0; i < ns_view.nl; i++) if (ns_view.lanes[i].is_ns) lane_live = 1;
