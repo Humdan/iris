@@ -1,15 +1,18 @@
 // iris_organism.h — the "digital organism" orb.
 //
-// An electric-blue, see-through holographic sphere: nested shells of circuit-like
-// traces around a hot, spinning core, with sweeping arcs and radial filaments.
+// An electric-blue, see-through holographic globe: curved circuit panels laid
+// out in latitude bands around a hot, spinning core, turning on a tilted axis.
 // It behaves like something alive:
-//   - each shell faces the viewer and spins at its own rate (concentric rings +
-//     radial runs, like a dial of gyroscopes), wobbling slowly on its axis
-//   - traces are born (drawn in with a bright growing tip), live, and fade;
-//     more of them are alive, and they turn over faster, when Iris is busy
-//   - every heartbeat sends a ripple of light outward through the shells
-//   - data pulses travel along traces; filaments flicker; the core breathes
-//   - the whole lattice undulates (low-frequency radial wobble)
+//   - the panels assemble into a sphere: they fly in bottom-first and lock in
+//     with a flash at startup, briefly come apart and snap back together when
+//     a new agent starts working, and hang loose and tumble while the setup is
+//     messy (order score), closing up as it gets tidy
+//   - each panel is lit by which way it faces, with a brighter rim and a dimmer
+//     far side, so it reads as a solid ball; a dim inner wireframe sphere spins
+//     the other way for depth
+//   - every heartbeat sends a ripple of light across the face; data pulses run
+//     around panel outlines when busy; the core breathes
+//   - agents ride three gyroscope rings outside the globe as comets
 //
 // Rendering: everything is splatted (bilinear, sub-pixel — no shimmer) into a
 // float HDR buffer around the orb, a cheap quarter-res bloom is added, and a
@@ -24,12 +27,13 @@
 #define ORG_BN      (ORG_N / ORG_BS)
 #define ORG_EXTENT  1.10f               // max on-screen radius in units of R (wobble + filaments + perspective)
 
-#define ORG_SHELLS     4
-#define ORG_SEGS       400
-#define ORG_SEG_PTS    72
-#define ORG_FILS       44
+#define ORG_BANDS      8                // latitude bands of panels
+#define ORG_TILES      96
+#define ORG_TILE_PTS   400
+#define ORG_SHELL_R    0.86f            // assembled globe radius (units of R); loose panels reach ~1.03
+#define ORG_INNER_R    0.50f            // inner wireframe sphere
+#define ORG_STAGGER    0.6f             // spread of the assembly wave (bottom band first)
 #define ORG_CORE_RINGS 5
-#define ORG_ARCS       3
 #define ORG_WAVES      6
 #define ORG_EMBERS     96
 #define ORG_LUT        2048
@@ -59,109 +63,140 @@ static M3 m3_ry(float a) { float c = cosf(a), s = sinf(a); M3 r = {{c,0,s, 0,1,0
 static M3 m3_rz(float a) { float c = cosf(a), s = sinf(a); M3 r = {{c,-s,0, s,c,0, 0,0,1}}; return r; }
 
 // ---- state ----
-static const float org_shell_r[ORG_SHELLS] = { 0.34f, 0.56f, 0.78f, 1.0f };
-static const int   org_shell_n[ORG_SHELLS] = { 40, 80, 120, 160 };   // sums to ORG_SEGS
-
+// One panel of the globe. Its points are stored relative to its home center
+// direction c (point = c + d on the unit sphere), so a loose panel can be moved
+// out, shrunk and tumbled as a rigid piece and lands exactly in place.
 typedef struct {
-  float spin, spin_spd;      // in-plane dial rotation (rad, rad/s)
-  float tilt_x, tilt_z;      // fixed tilt of the pole away from the viewer
-  float wob_ph;              // phase of the slow axis wobble
-} OrgShell;
-
-typedef struct {
-  int   shell;
-  int   npts;
-  float pts[ORG_SEG_PTS][3]; // local unit-sphere directions (pole = +Y)
-  float age, life, dormant;  // dormant > 0: dead, waiting to respawn
-  float bright;
+  float c[3];                 // home center direction (unit)
+  float lat;                  // center latitude
+  int   npts, nedge;          // [0,nedge) outline in perimeter order, [nedge,npts) inner trace
+  float d[ORG_TILE_PTS][3];
+  float a;                    // 0 loose .. 1 locked in place (eased)
+  float delay;                // place in the assembly wave (0 first .. ORG_STAGGER)
+  float axis[3], tumble;      // tumble axis and angle while loose
+  float drift[3];             // sideways drift while loose
+  float bob_ph;
+  float flash;                // white flash when it locks in
+  float flick;                // brief hologram dropout, decays back to 0
   float pulse_spd, pulse_off;
-  float flick;               // brief hologram dropout, decays back to 0
-} OrgSeg;
+  float bright;
+} OrgTile;
 
-typedef struct { float dir[3]; float len, ph, freq; } OrgFil;
 typedef struct { float axis_tilt, axis_rot, radius, spin, spd; } OrgRing;
 typedef struct { float r, strength; } OrgWave;
 typedef struct { float x, y, z, vx, vy, vz, life; } OrgEmber;
 
-static OrgShell org_shells[ORG_SHELLS];
-static OrgSeg   org_segs[ORG_SEGS];
-static OrgFil   org_fils[ORG_FILS];
+static OrgTile  org_tiles[ORG_TILES];
+static int      org_ntiles = 0;
+static float    org_spin = 0;          // globe rotation (rad)
+static float    org_assembled = 0;     // eased whole-globe assembly, 0 scattered .. 1 whole
+static float    org_kick = 1.0f;       // knocked apart (startup, new agent); decays as it reassembles
 static OrgRing  org_core[ORG_CORE_RINGS];
-static OrgRing  org_arcs[ORG_ARCS];
-static float    org_arc_span[ORG_ARCS];
 static OrgWave  org_waves[ORG_WAVES];
 static OrgEmber org_embers[ORG_EMBERS];
 static float    org_prev_beat_phase = 0;
-static float    org_R = 120;   // radius the segment sampling was built for
 static float    org_hotk[3] = { 0.55f, 0.85f, 1.0f };   // white-hot mix, set per frame by palette
 
-// Build a new circuit trace on its shell: 1-3 legs that alternate between
-// running along a latitude (appears as a concentric ring arc) and along a
-// longitude (appears as a radial run), with right-angle jogs between legs.
-static void org_seg_spawn(OrgSeg *s) {
-  float sr = org_shell_r[s->shell];
-  float y = org_rand() * 1.9f - 0.95f;
-  float lat = asinf(y), lon = org_rand() * 6.2831853f;
-  int legs = 1 + (org_rand() < 0.55f) + (org_rand() < 0.25f);
-  int along_lat = org_rand() < 0.72f;
-  float step = 1.5f / (org_R * sr);            // ~1.5px between samples
-  s->npts = 0;
-  for (int l = 0; l < legs && s->npts < ORG_SEG_PTS; l++) {
-    float len = along_lat ? (0.15f + org_rand() * 0.75f) : (0.06f + org_rand() * 0.28f);
-    float sgn = org_rand() < 0.5f ? -1.0f : 1.0f;
-    float cl = fmaxf(cosf(lat), 0.25f);
-    int n = (int)(len / step) + 1;
-    for (int k = 0; k < n && s->npts < ORG_SEG_PTS; k++) {
-      float *p = s->pts[s->npts++];
-      p[0] = cosf(lat) * cosf(lon); p[1] = sinf(lat); p[2] = cosf(lat) * sinf(lon);
-      if (along_lat) lon += sgn * step / cl;
-      else { lat += sgn * step; if (lat > 1.35f || lat < -1.35f) { sgn = -sgn; lat += 2 * sgn * step; } }
-    }
-    along_lat = !along_lat;
+static void org_sph(float lat, float lon, float *p) {
+  p[0] = cosf(lat) * cosf(lon); p[1] = sinf(lat); p[2] = cosf(lat) * sinf(lon);
+}
+
+static void org_norm3(float *v) {
+  float l = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+  if (l > 1e-6f) { v[0] /= l; v[1] /= l; v[2] /= l; }
+}
+
+static void org_cross(const float *a, const float *b, float *o) {
+  o[0] = a[1] * b[2] - a[2] * b[1]; o[1] = a[2] * b[0] - a[0] * b[2]; o[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+// rotation by angle a around unit axis k (Rodrigues)
+static M3 m3_axis(const float *k, float a) {
+  float c = cosf(a), s = sinf(a), v = 1 - c, x = k[0], y = k[1], z = k[2];
+  M3 r = {{ c + x * x * v,     x * y * v - z * s, x * z * v + y * s,
+            y * x * v + z * s, c + y * y * v,     y * z * v - x * s,
+            z * x * v - y * s, z * y * v + x * s, c + z * z * v }};
+  return r;
+}
+
+// A straight run in (lat, lon): along a latitude it's a ring arc, along a
+// longitude a meridian arc. Points land ~`step` apart on screen.
+static void org_tile_run(OrgTile *T, float la0, float lo0, float la1, float lo1, float step) {
+  float cl = fmaxf(cosf(0.5f * (la0 + la1)), 0.2f);
+  float len = sqrtf((la1 - la0) * (la1 - la0) + (lo1 - lo0) * (lo1 - lo0) * cl * cl);
+  int n = (int)(len / step) + 1;
+  for (int k = 0; k < n && T->npts < ORG_TILE_PTS; k++) {
+    float u = (float)k / n, p[3];
+    org_sph(la0 + (la1 - la0) * u, lo0 + (lo1 - lo0) * u, p);
+    float *d = T->d[T->npts++];
+    d[0] = p[0] - T->c[0]; d[1] = p[1] - T->c[1]; d[2] = p[2] - T->c[2];
   }
-  s->age = 0;
-  s->life = 4.0f + org_rand() * 10.0f;
-  s->dormant = 0;
-  s->bright = 0.35f + org_rand() * 0.65f;
-  s->pulse_spd = org_rand() < 0.5f ? 0.3f + org_rand() * 0.9f : 0.0f;
-  s->pulse_off = org_rand();
-  s->flick = 0;
+}
+
+// Lay the globe out: ORG_BANDS latitude bands (poles left open), each cut
+// into sectors so panels stay roughly square, with a thin seam between them.
+// Every panel gets its outline plus one of a few circuit traces inside.
+static void org_build_tiles(float R) {
+  const float LAT_MAX = 1.36f;                    // ~78 degrees
+  float step = 1.4f / (R * ORG_SHELL_R);          // ~1.4 px between samples
+  int nt = 0;
+  for (int b = 0; b < ORG_BANDS; b++) {
+    float la0 = -LAT_MAX + 2 * LAT_MAX * b / ORG_BANDS, la1 = -LAT_MAX + 2 * LAT_MAX * (b + 1) / ORG_BANDS;
+    float mid = 0.5f * (la0 + la1);
+    int sectors = (int)(16 * cosf(mid) + 0.5f);
+    if (sectors < 5) sectors = 5;
+    float off = org_rand() * 6.2831853f;          // stagger seams between bands, like brickwork
+    for (int s = 0; s < sectors && nt < ORG_TILES; s++) {
+      OrgTile *T = &org_tiles[nt++];
+      float lo0 = off + 6.2831853f * s / sectors, lo1 = off + 6.2831853f * (s + 1) / sectors;
+      float gl = 0.022f, go = 0.022f / fmaxf(cosf(mid), 0.3f);
+      float a0 = la0 + gl, a1 = la1 - gl, o0 = lo0 + go, o1 = lo1 - go;
+      org_sph(mid, 0.5f * (lo0 + lo1), T->c);
+      T->lat = mid; T->npts = 0;
+      org_tile_run(T, a0, o0, a0, o1, step); org_tile_run(T, a0, o1, a1, o1, step);
+      org_tile_run(T, a1, o1, a1, o0, step); org_tile_run(T, a1, o0, a0, o0, step);
+      T->nedge = T->npts;
+      float ma = 0.5f * (a0 + a1), mo = 0.5f * (o0 + o1), ha = 0.5f * (a1 - a0), ho = 0.5f * (o1 - o0);
+      switch ((int)(org_rand() * 4)) {
+        case 0:   // run, then a right-angle jog down
+          org_tile_run(T, ma + 0.35f * ha, o0 + 0.2f * ho, ma + 0.35f * ha, mo + 0.3f * ho, step);
+          org_tile_run(T, ma + 0.35f * ha, mo + 0.3f * ho, ma - 0.45f * ha, mo + 0.3f * ho, step);
+          break;
+        case 1:   // a chip
+          org_tile_run(T, ma - 0.3f * ha, mo - 0.3f * ho, ma - 0.3f * ha, mo + 0.3f * ho, step);
+          org_tile_run(T, ma - 0.3f * ha, mo + 0.3f * ho, ma + 0.3f * ha, mo + 0.3f * ho, step);
+          org_tile_run(T, ma + 0.3f * ha, mo + 0.3f * ho, ma + 0.3f * ha, mo - 0.3f * ho, step);
+          org_tile_run(T, ma + 0.3f * ha, mo - 0.3f * ho, ma - 0.3f * ha, mo - 0.3f * ho, step);
+          break;
+        case 2:   // drop from the top, then run right
+          org_tile_run(T, a1 - 0.2f * ha, mo - 0.5f * ho, ma, mo - 0.5f * ho, step);
+          org_tile_run(T, ma, mo - 0.5f * ho, ma, o1 - 0.2f * ho, step);
+          break;
+        default:  // plain panel
+          break;
+      }
+      // assembly order: bottom band first, a little shuffled within a band
+      T->delay = ORG_STAGGER * (0.75f * (mid + LAT_MAX) / (2 * LAT_MAX) + 0.25f * org_rand());
+      float r3[3] = { org_rand() * 2 - 1, org_rand() * 2 - 1, org_rand() * 2 - 1 };
+      org_cross(T->c, r3, T->axis); org_norm3(T->axis);
+      org_cross(T->c, T->axis, T->drift); org_norm3(T->drift);
+      T->tumble = (0.8f + 1.2f * org_rand()) * (org_rand() < 0.5f ? -1.0f : 1.0f);
+      T->bob_ph = org_rand() * 6.2831853f;
+      T->a = 0; T->flash = 0; T->flick = 0;
+      T->pulse_spd = org_rand() < 0.5f ? 0.25f + org_rand() * 0.6f : 0.0f;
+      T->pulse_off = org_rand();
+      T->bright = 0.6f + 0.4f * org_rand();
+    }
+  }
+  org_ntiles = nt;
 }
 
 static void org_init(float R) {
-  org_R = R;
-  for (int i = 0; i < ORG_SHELLS; i++) {
-    OrgShell *sh = &org_shells[i];
-    sh->spin = org_rand() * 6.2831853f;
-    sh->spin_spd = (0.05f + 0.07f * org_rand()) * ((i & 1) ? -1.0f : 1.0f);
-    sh->tilt_x = (org_rand() - 0.5f) * 0.45f;
-    sh->tilt_z = (org_rand() - 0.5f) * 0.45f;
-    sh->wob_ph = org_rand() * 6.2831853f;
-  }
-  int k = 0;
-  for (int sh = 0; sh < ORG_SHELLS; sh++)
-    for (int j = 0; j < org_shell_n[sh]; j++, k++) {
-      org_segs[k].shell = sh;
-      org_seg_spawn(&org_segs[k]);
-      org_segs[k].age = org_rand() * org_segs[k].life;   // start mid-life: no mass birth
-    }
-  for (int i = 0; i < ORG_FILS; i++) {
-    float z = org_rand() * 2 - 1, a = org_rand() * 6.2831853f, r = sqrtf(1 - z * z);
-    org_fils[i].dir[0] = r * cosf(a); org_fils[i].dir[1] = r * sinf(a); org_fils[i].dir[2] = z;
-    org_fils[i].len = 0.95f + org_rand() * 0.12f;
-    org_fils[i].ph = org_rand() * 6.2831853f;
-    org_fils[i].freq = 0.4f + org_rand() * 1.6f;
-  }
+  org_build_tiles(R);
   for (int i = 0; i < ORG_CORE_RINGS; i++) {
     org_core[i] = (OrgRing){ org_rand() * 3.14159f, org_rand() * 6.2831853f,
                              0.07f + 0.13f * org_rand(), org_rand() * 6.2831853f,
                              (0.8f + 1.8f * org_rand()) * (i & 1 ? -1.0f : 1.0f) };
-  }
-  for (int i = 0; i < ORG_ARCS; i++) {
-    org_arcs[i] = (OrgRing){ 0.3f + org_rand() * 1.2f, org_rand() * 6.2831853f,
-                             0.45f + 0.25f * org_rand(), org_rand() * 6.2831853f,
-                             (0.25f + 0.45f * org_rand()) * (i & 1 ? -1.0f : 1.0f) };
-    org_arc_span[i] = 1.4f + org_rand() * 2.0f;
   }
   for (int i = 0; i < ORG_WAVES; i++) org_waves[i].strength = 0;
   for (int i = 0; i < ORG_EMBERS; i++) org_embers[i].life = 0;
@@ -314,6 +349,7 @@ static void org_set_agents(const OrgAgentIn *in, int n) {
       int best = 0;
       for (int r = 1; r < ORG_GYRO_RINGS; r++) if (load[r] < load[best]) best = r;
       *c = (OrgComet){ in[i].id, in[i].kind, 0, 0, (in[i].id % 628) / 100.0f, best, 1, in[i].purpose };
+      org_kick = fmaxf(org_kick, 0.55f);   // a new agent: the globe comes apart and snaps back
     }
     c->alive = 1; c->kind = in[i].kind;
     c->act = in[i].activity < 0 ? 0 : in[i].activity > 1 ? 1 : in[i].activity;
@@ -463,107 +499,100 @@ static void org_frame(uint16_t *back, int W, int H, int STRIDE, float ox, float 
       if (org_waves[i].r > 1.3f) org_waves[i].strength = 0;
     }
   }
-  float shell_wave[ORG_SHELLS];
-  for (int s = 0; s < ORG_SHELLS; s++) {
-    float w = 0;
-    for (int i = 0; i < ORG_WAVES; i++) {
-      if (org_waves[i].strength <= 0.01f) continue;
-      float d = (org_shell_r[s] - org_waves[i].r) / 0.09f;
-      w += org_waves[i].strength * expf(-d * d);
-    }
-    shell_wave[s] = w;
-  }
-
   M3 G = m3_mul(m3_ry(yaw), m3_rx(pitch));
+  float chaos = org_chaos(order);
 
-  // Chaotic setup: shells fall out of sync, traces wobble and drop out
-  float jitter = org_chaos(order);
+  // --- assembly: a tidy setup closes into a whole sphere, a messy one leaves
+  //     panels hanging loose; kicks (startup, new agent) knock it apart ---
+  org_kick = fmaxf(org_kick - dt * 0.30f, 0.0f);
+  float A_target = fminf(1.0f - 0.6f * chaos, 1.0f - org_kick);
+  org_assembled += (A_target - org_assembled) * (1.0f - expf(-3.0f * dt));
 
-  // shell matrices: spin in-plane, tilt the pole to face the viewer, wobble
-  M3 SM[ORG_SHELLS];
-  for (int s = 0; s < ORG_SHELLS; s++) {
-    OrgShell *sh = &org_shells[s];
-    sh->spin += sh->spin_spd * speed * dt;
-    // each shell gets its own off-beat tumble, so they stop moving as one
-    float jitter_phase = jitter * 0.35f * sinf(t * 1.7f + s * 1.5f);
-    float wob = 0.10f * sinf(t * 0.13f + sh->wob_ph) + jitter * 0.25f * sinf(t * 1.1f + s * 2.3f);
-    SM[s] = m3_mul(G, m3_mul(m3_rx(1.5707963f + sh->tilt_x + wob),
-                             m3_mul(m3_rz(sh->tilt_z - wob * 0.7f + jitter_phase), m3_ry(sh->spin))));
-  }
+  // the globe turns on a tilted axis; light comes from the upper left, in front
+  org_spin += 0.16f * speed * dt;
+  M3 GW = m3_mul(G, m3_mul(m3_rx(0.38f), m3_ry(org_spin)));   // globe world matrix
+  const float L[3] = { -0.45f, 0.55f, 0.70f };
 
-  // --- circuit traces ---
-  float wob_amp = 0.025f + 0.035f * act + 0.10f * jitter;   // more wobble when chaotic
-  for (int i = 0; i < ORG_SEGS; i++) {
-    OrgSeg *s = &org_segs[i];
-    if (s->dormant > 0) {                   // dead: wait, then be reborn
-      s->dormant -= dt * (0.4f + 5.6f * act);   // fewer traces alive at rest
-      if (s->dormant <= 0) org_seg_spawn(s);
-      continue;
+  // --- panels ---
+  for (int i = 0; i < org_ntiles; i++) {
+    OrgTile *T = &org_tiles[i];
+    float tgt = org_assembled * (1.0f + ORG_STAGGER) - T->delay;
+    tgt = tgt < 0 ? 0 : tgt > 1 ? 1 : tgt;
+    float prev = T->a;
+    T->a += (tgt - T->a) * (1.0f - expf(-5.0f * dt));
+    if (prev < 0.97f && T->a >= 0.97f) T->flash = 1.0f;     // locks in
+    T->flash = fmaxf(T->flash - dt * 2.5f, 0.0f);
+    if (T->flick > 0) T->flick -= dt * 4.0f;
+    else if (org_rand() < dt * (0.002f + 0.01f * act + 0.25f * chaos)) T->flick = 1.0f;   // dropout
+
+    float l = 1.0f - T->a, ls = l * l * (3 - 2 * l);         // eased looseness
+    float bob = ls * sinf(t * 1.3f + T->bob_ph);
+    float out = 0.20f * ls + 0.02f * bob;
+    float scl = ORG_SHELL_R * (1.0f - 0.40f * ls);
+    M3 Mt = m3_axis(T->axis, T->tumble * ls + 0.15f * bob);
+    M3 P = m3_mul(GW, Mt);
+    float home[3] = { T->c[0] * ORG_SHELL_R * (1 + out) + T->drift[0] * 0.10f * ls,
+                      T->c[1] * ORG_SHELL_R * (1 + out) + T->drift[1] * 0.10f * ls,
+                      T->c[2] * ORG_SHELL_R * (1 + out) + T->drift[2] * 0.10f * ls };
+    float base[3], n[3];
+    org_xf(&GW, home[0], home[1], home[2], base);
+    org_xf(&P, T->c[0], T->c[1], T->c[2], n);
+
+    // lit by facing: diffuse + a bright rim at the silhouette; far side dimmer
+    float diff = fmaxf(n[0] * L[0] + n[1] * L[1] + n[2] * L[2], 0.0f);
+    float rim = 1.0f - fabsf(n[2]); rim = rim * rim * rim;
+    float shade = (0.40f + 0.60f * diff + 0.55f * rim) * (n[2] < 0 ? 0.55f : 1.0f);
+    // heartbeat ripple spreads outward from the middle of the face
+    float pos = acosf(fminf(fmaxf(n[2], -1.0f), 1.0f)) / 3.14159f * 1.3f, wave = 0;
+    for (int w = 0; w < ORG_WAVES; w++) {
+      if (org_waves[w].strength <= 0.01f) continue;
+      float dd = (pos - org_waves[w].r) / 0.10f;
+      wave += org_waves[w].strength * expf(-dd * dd);
     }
-    s->age += dt * (0.35f + 1.65f * act);      // slow turnover at rest
-    if (s->age >= s->life) { s->dormant = 0.5f + org_rand() * 5.0f; continue; }
-    if (s->flick > 0) s->flick -= dt * 4.0f;
-    else if (org_rand() < dt * (0.004f + 0.026f * act + 0.35f * jitter)) s->flick = 1.0f;   // hologram dropout (rare at rest, constant when chaotic)
+    float I0 = 0.55f * level * T->bright * shade * (0.6f + 0.4f * T->a) * (1.0f - 0.85f * fmaxf(T->flick, 0.0f));
+    I0 *= 1.0f + wave;
+    float hot0 = 0.12f * act + 1.2f * T->flash + 0.9f * wave;
+    float pulse_on = T->pulse_spd > 0 ? (0.06f + 1.59f * act) : 0.0f;
+    float head = org_frac(t * T->pulse_spd * speed * 0.25f + T->pulse_off) * T->nedge;
 
-    float grow = fminf(s->age / 0.7f, 1.0f);
-    float fade = fminf((s->life - s->age) / 1.2f, 1.0f);
-    float alpha = grow < 1.0f ? 1.0f : fade;
-    alpha *= 1.0f - 0.8f * fmaxf(s->flick, 0.0f);
-    int drawn = (int)(s->npts * grow);
-    if (drawn < 1) continue;
-
-    float sr = org_shell_r[s->shell];
-    float I0 = (0.52f - 0.02f * act) * level * s->bright * alpha;   // busy gets pulses/ripples on top
-    float wave = shell_wave[s->shell];
-    float pulse_on = s->pulse_spd > 0 ? (0.06f + 1.59f * act) : 0.0f;
-    float head = org_frac(s->age * s->pulse_spd * speed * 0.5f + s->pulse_off) * s->npts;
-    const M3 *M = &SM[s->shell];
-    for (int k = 0; k < drawn; k++) {
-      const float *d = s->pts[k];
-      float rs = sr * (1.0f + wob_amp * sinf(3.1f * d[0] + t * 0.9f) * sinf(2.7f * d[2] - t * 0.7f + d[1]));
-      float p[3]; org_xf(M, d[0] * rs, d[1] * rs, d[2] * rs, p);
-      float hot = wave * 0.9f;
-      float I = I0 * (1.0f + wave * 1.0f);
-      if (pulse_on > 0) {
-        float dk = (k - head) / 2.5f;
-        float pb = pulse_on * expf(-dk * dk);
-        I += 0.30f * pb * alpha; hot += pb;
+    for (int k = 0; k < T->npts; k++) {
+      const float *d = T->d[k];
+      float q[3]; org_xf(&P, d[0] * scl, d[1] * scl, d[2] * scl, q);
+      float I = I0, hot = hot0;
+      if (k >= T->nedge) I *= 0.55f;                          // inner trace is fainter
+      else if (pulse_on > 0) {
+        float dk = fabsf(k - head); if (dk > T->nedge * 0.5f) dk = T->nedge - dk;
+        float pb = pulse_on * expf(-(dk / 2.5f) * (dk / 2.5f));
+        I += 0.30f * pb; hot += pb;
       }
-      if (grow < 1.0f && k >= drawn - 3) { I += (0.15f + 0.35f * act) * alpha; hot += 0.3f + 0.7f * act; }  // growing tip
-      org_plot(&pj, p[0], p[1], p[2], I, hot, gold);
+      org_plot(&pj, base[0] + q[0], base[1] + q[1], base[2] + q[2], I, hot, gold);
     }
   }
 
-  // --- radial filaments: faint spokes that flicker like firing nerves ---
+  // --- inner wireframe sphere: dim, counter-rotating, for depth ---
   {
-    M3 F = m3_mul(G, m3_rz(t * 0.03f * speed));
-    float step = 1.8f / R;
-    for (int i = 0; i < ORG_FILS; i++) {
-      OrgFil *f = &org_fils[i];
-      float s = 0.5f + 0.5f * sinf(t * f->freq * speed + f->ph);
-      s = s * s; s = s * s; s = s * s;                  // spiky ^8
-      float I0 = level * (0.010f + 0.005f * act + s * (0.03f + 0.32f * act));
-      if (I0 < 0.01f) continue;
-      float d[3]; org_xf(&F, f->dir[0], f->dir[1], f->dir[2], d);
-      for (float r = 0.28f; r < f->len; r += step) {
-        float taper = sinf((r - 0.28f) / (f->len - 0.28f) * 3.14159f);
-        org_plot(&pj, d[0] * r, d[1] * r, d[2] * r, I0 * taper, s * 0.6f, gold);
+    M3 Wi = m3_mul(G, m3_mul(m3_rx(0.38f), m3_ry(-1.6f * org_spin)));
+    float r = ORG_INNER_R, step = 1.6f / (R * r);
+    float I = level * (0.09f + 0.06f * act);
+    for (int la = -2; la <= 2; la++) {                        // 5 latitudes
+      float lat = la * 0.50f;
+      int n = (int)(6.2831853f * cosf(lat) / step);
+      for (int k = 0; k < n; k++) {
+        float p[3], q[3]; org_sph(lat, 6.2831853f * k / n, p);
+        org_xf(&Wi, p[0] * r, p[1] * r, p[2] * r, q);
+        org_plot(&pj, q[0], q[1], q[2], I, 0.1f, gold);
       }
     }
-  }
-
-  // --- sweeping arcs: comets on tilted great circles ---
-  for (int i = 0; i < ORG_ARCS; i++) {
-    OrgRing *a = &org_arcs[i];
-    a->spin += a->spd * speed * dt;
-    M3 A = m3_mul(G, m3_mul(m3_rz(a->axis_rot + t * 0.05f), m3_rx(a->axis_tilt)));
-    int n = (int)(org_arc_span[i] * a->radius * R / 1.2f);
-    for (int k = 0; k < n; k++) {
-      float u = (float)k / n;                          // 0 tail .. 1 head
-      float ang = a->spin - (1.0f - u) * org_arc_span[i];
-      float p[3]; org_xf(&A, cosf(ang) * a->radius, 0, sinf(ang) * a->radius, p);
-      float I = level * (0.05f + 0.50f * u * u * u) * (0.35f + 0.95f * act);
-      org_plot(&pj, p[0], p[1], p[2], I, u * u * 0.8f, gold);
+    int n = (int)(6.2831853f / step);
+    for (int m = 0; m < 6; m++) {                             // 12 meridians
+      float lon = 3.14159f * m / 6;
+      for (int k = 0; k < n; k++) {
+        float a = 6.2831853f * k / n;
+        if (fabsf(sinf(a)) > 0.97f) continue;                 // keep the poles from piling up
+        float p[3] = { cosf(a) * cosf(lon) * r, sinf(a) * r, cosf(a) * sinf(lon) * r }, q[3];
+        org_xf(&Wi, p[0], p[1], p[2], q);
+        org_plot(&pj, q[0], q[1], q[2], I, 0.1f, gold);
+      }
     }
   }
 
@@ -614,7 +643,7 @@ static void org_frame(uint16_t *back, int W, int H, int STRIDE, float ox, float 
       for (int i = 0; i < ORG_EMBERS; i++) if (org_embers[i].life <= 0) {
         float z = org_rand() * 2 - 1, a = org_rand() * 6.2831853f, r = sqrtf(1 - z * z);
         float x = r * cosf(a), y = r * sinf(a), sp = 0.25f + 0.4f * org_rand() + 0.3f * act;
-        org_embers[i] = (OrgEmber){ x * 0.9f, y * 0.9f, z * 0.9f, x * sp, y * sp, z * sp, 1.0f };
+        org_embers[i] = (OrgEmber){ x * ORG_SHELL_R, y * ORG_SHELL_R, z * ORG_SHELL_R, x * sp, y * sp, z * sp, 1.0f };
         break;
       }
     }
