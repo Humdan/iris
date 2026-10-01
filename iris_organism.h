@@ -288,10 +288,11 @@ static inline float org_frac(float x) { return x - floorf(x); }
 // the rings: Claude = white-hot head / cyan tail, Hermes = orange. A comet's
 // speed and tail length follow its agent's activity; the more total work, the
 // brighter and faster the whole frame turns.
+// Purpose: 'u' = working for Humdan (drives nucleus dilation), 's' = working for itself (drives ring precession)
 #define ORG_GYRO_RINGS 3
 #define ORG_AGENTS     8
-typedef struct { uint32_t id; char kind; float activity; } OrgAgentIn;   // kind 'c' claude, 'h' hermes
-typedef struct { uint32_t id; char kind; float act, vis, pos; int ring, alive; } OrgComet;
+typedef struct { uint32_t id; char kind; float activity; char purpose; } OrgAgentIn;   // kind 'c'/'h', purpose 'u'/'s'
+typedef struct { uint32_t id; char kind; float act, vis, pos; int ring, alive; char purpose; } OrgComet;
 static OrgComet org_comets[ORG_AGENTS];
 static int      org_ncomets = 0;
 static const float org_gyro_r[ORG_GYRO_RINGS] = { 1.00f, 0.92f, 1.04f };
@@ -312,10 +313,11 @@ static void org_set_agents(const OrgAgentIn *in, int n) {
       for (int k = 0; k < org_ncomets - 1; k++) load[org_comets[k].ring]++;
       int best = 0;
       for (int r = 1; r < ORG_GYRO_RINGS; r++) if (load[r] < load[best]) best = r;
-      *c = (OrgComet){ in[i].id, in[i].kind, 0, 0, (in[i].id % 628) / 100.0f, best, 1 };
+      *c = (OrgComet){ in[i].id, in[i].kind, 0, 0, (in[i].id % 628) / 100.0f, best, 1, in[i].purpose };
     }
     c->alive = 1; c->kind = in[i].kind;
     c->act = in[i].activity < 0 ? 0 : in[i].activity > 1 ? 1 : in[i].activity;
+    c->purpose = in[i].purpose;
   }
 }
 
@@ -328,7 +330,8 @@ static inline void org_plot_rgb(const OrgProj *pj, float x, float y, float z, fl
   org_splat(bx + 0.6f, by + 0.6f, r * dc * 0.5f, g * dc * 0.5f, b * dc * 0.5f);
 }
 
-static void org_gyro(const OrgProj *pj, const M3 *G, float R, float dt, float act, float night) {
+static void org_gyro(const OrgProj *pj, const M3 *G, float R, float dt, float t, float act, float night,
+                    float u_max, float s_max, float order) {
   // ease comets, drop fully faded ones
   float busy = 0;
   int out = 0;
@@ -341,13 +344,21 @@ static void org_gyro(const OrgProj *pj, const M3 *G, float R, float dt, float ac
   }
   org_ncomets = out;
   float b = fminf(busy / 2.0f, 1.0f);                 // 0 idle .. 1 (two fully busy agents)
+  // Order-driven coherence: low order = phase jitter, wobble, filament flicker
+  float jitter = 1.0f - order;   // 0 = organized, 1 = chaotic
+  float wob_amp = 0.025f + 0.035f * act + 0.025f * jitter;  // more wobble when chaotic
 
   // the armature: faint rings with tick marks, tinted like the body
+  // Precession speed is driven by s_max (activity for self) and act
   float tint[3] = { 0.55f + 0.40f * night, 0.78f - 0.55f * night, 1.0f - 0.75f * night };   // whiter than the body
   M3 RM[ORG_GYRO_RINGS];
   for (int r = 0; r < ORG_GYRO_RINGS; r++) {
-    org_gyro_prec[r] += (0.025f + 0.16f * b + 0.03f * act) * dt * (r & 1 ? -1.0f : 1.0f);
-    RM[r] = m3_mul(*G, m3_mul(m3_rz(org_gyro_tilt[r][1] + org_gyro_prec[r]), m3_rx(org_gyro_tilt[r][0])));
+    // Precession is driven by s_max (activity for self) and act
+    org_gyro_prec[r] += (0.025f + 0.16f * s_max + 0.03f * act) * dt * (r & 1 ? -1.0f : 1.0f);
+    // Low order: rings drift out of their neat aligned pose
+    float drift = jitter * 0.05f * sinf(t * 0.3f + r * 2.0f);
+    RM[r] = m3_mul(*G, m3_mul(m3_rz(org_gyro_tilt[r][1] + org_gyro_prec[r] + drift),
+                             m3_rx(org_gyro_tilt[r][0] - drift * 0.5f)));
     float rr = org_gyro_r[r];
     int n = (int)(6.2831853f * rr * R / 1.3f);
     float I0 = 0.16f + 0.16f * b;
@@ -406,9 +417,13 @@ static void org_gyro(const OrgProj *pj, const M3 *G, float R, float dt, float ac
 //   beat       heartbeat envelope (~-0.2..1), beat_phase its phase (cycles)
 //   night      0..1 (eased by the caller): blend the palette to maroon while
 //              night shift runs
+//   u_max      max activity of purpose='u' agents (drives nucleus dilation)
+//   s_max      max activity of purpose='s' agents (drives ring precession)
+//   order      order score 0..1 (0 chaotic, 1 organized): drives shell coherence
 static void org_frame(uint16_t *back, int W, int H, int STRIDE, float ox, float oy,
                       float R, float t, float dt, float act, float yaw, float pitch,
-                      float beat, float beat_phase, float night) {
+                      float beat, float beat_phase, float night,
+                      float u_max, float s_max, float order) {
   memset(org_acc, 0, sizeof(org_acc));
   OrgProj pj = { R, ORG_N / 2.0f };
 
@@ -454,18 +469,24 @@ static void org_frame(uint16_t *back, int W, int H, int STRIDE, float ox, float 
 
   M3 G = m3_mul(m3_ry(yaw), m3_rx(pitch));
 
+  // Order-driven coherence: low order = phase jitter, wobble, filament flicker
+  float jitter = 1.0f - order;   // 0 = organized, 1 = chaotic
+
   // shell matrices: spin in-plane, tilt the pole to face the viewer, wobble
+  // Low order = phase jitter between shells, wobble, filament flicker
   M3 SM[ORG_SHELLS];
   for (int s = 0; s < ORG_SHELLS; s++) {
     OrgShell *sh = &org_shells[s];
     sh->spin += sh->spin_spd * speed * dt;
-    float wob = 0.10f * sinf(t * 0.13f + sh->wob_ph);
+    // Low order: shells drift out of sync, phase jitter between shells
+    float jitter_phase = jitter * 0.05f * sinf(t * 0.7f + s * 1.5f);
+    float wob = 0.10f * sinf(t * 0.13f + sh->wob_ph) + jitter * 0.05f * sinf(t * 0.5f + s * 2.3f);
     SM[s] = m3_mul(G, m3_mul(m3_rx(1.5707963f + sh->tilt_x + wob),
-                             m3_mul(m3_rz(sh->tilt_z - wob * 0.7f), m3_ry(sh->spin))));
+                             m3_mul(m3_rz(sh->tilt_z - wob * 0.7f + jitter_phase), m3_ry(sh->spin))));
   }
 
   // --- circuit traces ---
-  float wob_amp = 0.025f + 0.035f * act;
+  float wob_amp = 0.025f + 0.035f * act + 0.025f * jitter;   // more wobble when chaotic
   for (int i = 0; i < ORG_SEGS; i++) {
     OrgSeg *s = &org_segs[i];
     if (s->dormant > 0) {                   // dead: wait, then be reborn
@@ -541,11 +562,14 @@ static void org_frame(uint16_t *back, int W, int H, int STRIDE, float ox, float 
   }
 
   // --- core: spinning knot of small rings + a breathing glow ---
+  // Nucleus dilates with u_max (work for Humdan) - eased ~1s
+  float nucleus_dilate = u_max;  // 0 idle, 1 busy for Humdan
+  float nucleus_r = 0.07f + 0.13f * org_rand() + 0.08f * nucleus_dilate;
   for (int i = 0; i < ORG_CORE_RINGS; i++) {
     OrgRing *c = &org_core[i];
     c->spin += c->spd * speed * dt;
     M3 C = m3_mul(G, m3_mul(m3_rz(c->axis_rot + t * 0.2f * (i + 1) * 0.3f), m3_mul(m3_rx(c->axis_tilt), m3_ry(c->spin))));
-    float rr = c->radius * (1.0f + 0.15f * beat_pos);
+    float rr = c->radius * (1.0f + 0.15f * beat_pos) * (1.0f + 0.3f * nucleus_dilate);  // dilate with u_max
     int n = (int)(6.2831853f * rr * R / 1.2f) + 8;
     for (int k = 0; k < n; k++) {
       float ang = 6.2831853f * k / n;
@@ -571,7 +595,7 @@ static void org_frame(uint16_t *back, int W, int H, int STRIDE, float ox, float 
   }
 
   // --- agent gyroscope: armature rings + one comet per running agent ---
-  org_gyro(&pj, &G, R, dt, act, night);
+  org_gyro(&pj, &G, R, dt, t, act, night, u_max, s_max, order);
 
   // --- embers: sparks thrown off the surface when busy ---
   {
