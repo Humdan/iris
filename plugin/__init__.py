@@ -155,6 +155,8 @@ _lock = threading.Lock()
 _level = 0.0          # decaying activity 0..1
 _inflight = 0         # LLM requests currently in flight
 _last_written = -1.0
+_last_write_t = 0.0
+_REFRESH_S = 5.0
 _writer_started = False
 
 # Tunables
@@ -172,8 +174,11 @@ def _bump(amount: float) -> None:
 
 
 def _write(level: float) -> None:
-    global _last_written
-    if abs(level - _last_written) < 0.01:
+    global _last_written, _last_write_t
+    # Unchanged levels are still rewritten every _REFRESH_S while active so the
+    # renderer can tell a live writer from a dead one by the file's mtime.
+    now = time.monotonic()
+    if abs(level - _last_written) < 0.01 and (level <= 0.0 or now - _last_write_t < _REFRESH_S):
         return
     tmp = _STATE_FILE + ".tmp"
     try:
@@ -181,6 +186,7 @@ def _write(level: float) -> None:
             f.write(f"{level:.3f}\n")
         os.replace(tmp, _STATE_FILE)
         _last_written = level
+        _last_write_t = now
     except OSError:
         pass
 

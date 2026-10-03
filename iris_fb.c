@@ -202,6 +202,7 @@ static int ns_manual_expire(int ns_manual, int ns_running) {
 #define AGENTS_FILE  "/tmp/iris_agents.txt"
 #define AGENT_IDLE_S 120.0
 #define ORDER_FILE   "/tmp/iris_order"
+#define STATE_STALE_S 120.0   // activity file untouched this long = writer is gone
 #define ORDER_STALE_S 900.0   // 15 minutes; iris-order.py rewrites it every 5
 
 static const char *env_or(const char *name, const char *def) { const char *v = getenv(name); return v && *v ? v : def; }
@@ -691,7 +692,13 @@ int main(int argc, char **argv) {
             FILE *sf = fopen(state_file, "r");
             if (sf) {
                 char buf[64] = {0};
-                if (fgets(buf, 63, sf)) {
+                // The plugin refreshes this file every few seconds while active, so a
+                // file untouched for STATE_STALE_S means the writer died: fall to idle
+                // instead of holding the last level forever.
+                struct stat sst;
+                int state_stale = fstat(fileno(sf), &sst) == 0 && difftime(time(NULL), sst.st_mtime) > STATE_STALE_S;
+                if (state_stale) target = 0.0f;
+                else if (fgets(buf, 63, sf)) {
                     if (strncmp(buf, "thinking", 8) == 0) target = 1.0f;
                     else if (strncmp(buf, "idle", 4) == 0) target = 0.0f;
                     else { char *end; float x = strtof(buf, &end); target = end != buf ? clampf(x, 0, 1) : 0.0f; }
