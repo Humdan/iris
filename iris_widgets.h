@@ -1495,7 +1495,8 @@ static void draw_ns_queue_detail(uint16_t *back, int W, int H, int STRIDE,
 // of it. Format: one "key=value" per line; unknown keys are ignored, so the
 // script can grow fields without breaking this reader.
 typedef struct {
-  int have;            // 1 if cache file present and parsed
+  int have;            // 1 if cache file present, parsed and fresh
+  int stale_min;       // >0: file exists but is this many minutes old (have stays 0)
   float total;         // combined value of both books, USD
   float basis;         // combined starting cash (what was invested)
   float pnl_pct;       // % change vs basis, all time
@@ -1783,10 +1784,21 @@ static void draw_session_orbs(uint16_t *back, int W, int H, int STRIDE,
   }
 }
 
+// portfolio-cache.sh runs every 5 min and keeps the old file when it fails, so
+// a file older than this means the figures are no longer verified: show STALE
+// rather than a confident but outdated balance.
+#define PORTFOLIO_STALE_S 1800
+
 static void read_portfolio_stats(PortfolioStats *p) {
   memset(p, 0, sizeof(*p));
   FILE *f = fopen("/tmp/iris_portfolio", "r");
   if (!f) return;
+  struct stat sb;
+  if (fstat(fileno(f), &sb) == 0 && time(NULL) - sb.st_mtime > PORTFOLIO_STALE_S) {
+    p->stale_min = (int)((time(NULL) - sb.st_mtime) / 60);
+    fclose(f);
+    return;
+  }
   char line[128];
   while (fgets(line, sizeof(line), f)) {
     char key[32]; float v;
@@ -1970,7 +1982,14 @@ static void draw_agent_panel(uint16_t *back, int W, int H, int STRIDE, const Age
     }
   } else {
     wtext(back, W, H, STRIDE, PF_L, PF_TOP + 4, "PORTFOLIO", 1, dim_r, dim_g, dim_b);
-    wtext(back, W, H, STRIDE, PF_L + 60, PF_TOP, "NO DATA", 2, dim_r, dim_g, dim_b);
+    if (pf->stale_min > 0) {
+      if (pf->stale_min < 60) snprintf(buf, sizeof(buf), "STALE %dM", pf->stale_min);
+      else                    snprintf(buf, sizeof(buf), "STALE %dH", pf->stale_min / 60);
+      wtext(back, W, H, STRIDE, PF_L + 60, PF_TOP, buf, 2, bad_r, bad_g, bad_b);
+      wtext(back, W, H, STRIDE, PF_L, PF_TOP + 26, "PRICE CACHE HAS NOT REFRESHED", 1, dim_r, dim_g, dim_b);
+    } else {
+      wtext(back, W, H, STRIDE, PF_L + 60, PF_TOP, "NO DATA", 2, dim_r, dim_g, dim_b);
+    }
   }
 }
 
