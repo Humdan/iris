@@ -1316,6 +1316,8 @@ static void read_agent_stats(AgentStats *a) {
 // render loop never has to touch sqlite or parse markdown.
 #define NSQ_FILE "/tmp/iris_ns_queue"
 #define NSQ_MAX  40
+// a cache older than this no longer says what the agent is doing: flag it
+#define NSQ_STALE_S 2700
 
 typedef struct {
   char kind[6];        // REQ / LEAD / CARD
@@ -1328,12 +1330,16 @@ typedef struct {
   NsQueueItem items[NSQ_MAX];
   int n;
   int waiting, running, done;
+  int stale_min;       // >0: file is this many minutes old, states are not live
 } NsQueue;
 
 static void read_ns_queue(NsQueue *q) {
   memset(q, 0, sizeof(*q));
   FILE *f = fopen(NSQ_FILE, "r");
   if (!f) return;
+  struct stat sb;
+  if (fstat(fileno(f), &sb) == 0 && time(NULL) - sb.st_mtime > NSQ_STALE_S)
+    q->stale_min = (int)((time(NULL) - sb.st_mtime) / 60);
   char line[260];
   while (q->n < NSQ_MAX && fgets(line, sizeof(line), f)) {
     char *nl = strchr(line, '\n'); if (nl) *nl = 0;
@@ -1375,10 +1381,15 @@ static void draw_ns_queue(uint16_t *back, int W, int H, int STRIDE,
   wtext(back, W, H, STRIDE, lx, ly - 28, hdr, 2, 0.60f, 0.45f, 0.75f);
   if (q->n) {
     char sub[40];
-    snprintf(sub, sizeof(sub), "%d RUN %d WAIT %d DONE", q->running, q->waiting, q->done);
+    int stale = q->stale_min > 0;
+    if (!stale)
+      snprintf(sub, sizeof(sub), "%d RUN %d WAIT %d DONE", q->running, q->waiting, q->done);
+    else if (q->stale_min < 60) snprintf(sub, sizeof(sub), "STALE %dM", q->stale_min);
+    else                        snprintf(sub, sizeof(sub), "STALE %dH", q->stale_min / 60);
     // Sit after the header rather than at a fixed offset: "NIGHT 12" is wider
     // than "NIGHT 4" and the two were overlapping at two digits.
-    wtext(back, W, H, STRIDE, lx + (int)strlen(hdr) * 12 + 10, ly - 22, sub, 1, dim_r, dim_g, dim_b);
+    wtext(back, W, H, STRIDE, lx + (int)strlen(hdr) * 12 + 10, ly - 22, sub, 1,
+          stale ? 0.95f : dim_r, stale ? 0.55f : dim_g, stale ? 0.20f : dim_b);
   }
 
   if (q->n == 0) {
