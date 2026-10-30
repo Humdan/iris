@@ -35,6 +35,7 @@ typedef struct {
   int n, nup;       // list entries (D + S) and how many passed
   int net;          // -1 unknown, else the INTERNET probe
   int stale;        // no file, or no beat for 3 intervals: trust nothing in it
+  int stale_min;    // >0: minutes since the last beat (0 when no file or <1 min)
 } SvcStats;
 
 static void read_services(SvcStats *sv) {
@@ -63,6 +64,7 @@ static void read_services(SvcStats *sv) {
   fclose(f);
   if (interval < 1) interval = 15;
   sv->stale = !ts || (time(NULL) - ts) > 3L * interval;
+  if (ts && sv->stale) sv->stale_min = (int)((time(NULL) - ts) / 60);
 }
 
 static void svc_dot(uint16_t *back, int W, int H, int STRIDE, int x, int y, int d,
@@ -85,7 +87,10 @@ static void draw_services(uint16_t *back, int W, int H, int STRIDE, const SvcSta
   // --- header: SERVICES  up/total  [+] ---
   int x = wtext(back, W, H, STRIDE, lx, hy, "SERVICES", 2, dim_r, dim_g, dim_b);
   if (sv->stale) {
-    wtext(back, W, H, STRIDE, x + 10, hy + 4, "NO HEARTBEAT", 1, bad_r, bad_g, bad_b);
+    if (sv->stale_min <= 0)      snprintf(buf, sizeof(buf), "NO HEARTBEAT");
+    else if (sv->stale_min < 60) snprintf(buf, sizeof(buf), "NO HEARTBEAT %dM", sv->stale_min);
+    else                         snprintf(buf, sizeof(buf), "NO HEARTBEAT %dH", sv->stale_min / 60);
+    wtext(back, W, H, STRIDE, x + 10, hy + 4, buf, 1, bad_r, bad_g, bad_b);
   } else {
     snprintf(buf, sizeof(buf), "%d/%d", sv->nup, sv->n);
     int all = sv->nup == sv->n;
