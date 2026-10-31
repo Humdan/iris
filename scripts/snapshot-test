@@ -1,0 +1,19 @@
+#!/bin/sh
+# Smoke test: render an off-screen snapshot (no framebuffer, no lock, no touch)
+# and check it is a full 800x480 RGB565 frame that isn't blank.
+# Safe to run while the live renderer owns the screen.
+set -e
+bin=${1:-./iris_fb}
+out=$(mktemp /tmp/iris-snaptest.XXXXXX)
+trap 'rm -f "$out"' EXIT
+IRIS_SNAPSHOT="$out" IRIS_SNAPSHOT_FRAMES=30 "$bin"
+size=$(wc -c < "$out")
+if [ "$size" -ne 768000 ]; then
+    echo "snapshot-test: FAIL, frame is $size bytes, expected 768000" >&2
+    exit 1
+fi
+if [ "$(tr -d '\000' < "$out" | wc -c)" -lt 1000 ]; then
+    echo "snapshot-test: FAIL, frame is blank" >&2
+    exit 1
+fi
+echo "snapshot-test: ok (768000 bytes, non-blank)"

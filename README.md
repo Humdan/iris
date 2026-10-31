@@ -58,6 +58,8 @@ scripts/lcd-shot --from /tmp/iris.raw out.png
 Renders ~2 s off-screen (no framebuffer, no lock, no touch) and writes the last
 frame as raw RGB565 800×480. Safe to run while the live renderer owns the screen.
 
+`make test` runs the same render and checks the frame is full-size and not blank.
+
 ### Install as a service
 
 ```bash

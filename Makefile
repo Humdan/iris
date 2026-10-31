@@ -4,4 +4,6 @@ iris_fb: iris_fb.c iris_widgets.h iris_organism.h iris_layout.h iris_services.h
 	$(CC) $(CFLAGS) -o $@ $< -lm -lpthread
 clean:
 	rm -f iris_fb
-.PHONY: clean
+test: iris_fb
+	sh scripts/snapshot-test ./iris_fb
+.PHONY: clean test
